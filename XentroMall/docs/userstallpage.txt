@@ -1,0 +1,362 @@
+<?php
+// Database connection
+$conn = new mysqli('localhost', 'root', '', 'xentromall');
+
+// Check connection
+if ($conn->connect_error) {
+    die("Connection failed: " . $conn->connect_error);
+}
+
+// Initialize filters from GET parameters
+$size_filter = isset($_GET['size']) ? trim($_GET['size']) : '';
+$price_min = isset($_GET['price_min']) ? floatval($_GET['price_min']) : 0;
+$price_max = isset($_GET['price_max']) ? floatval($_GET['price_max']) : PHP_FLOAT_MAX;
+$location_filter = isset($_GET['location']) ? trim($_GET['location']) : '';
+
+// Build base query
+$query = "SELECT * FROM stalls WHERE status = 'available'";
+$types = '';
+$params = [];
+
+// Add size filter if specified
+if (!empty($size_filter)) {
+    $query .= " AND floor_area LIKE ?";
+    $types .= 's';
+    $params[] = "%$size_filter%";
+}
+
+// Add price range filters
+if ($price_min > 0 || $price_max < PHP_FLOAT_MAX) {
+    if ($price_min > 0 && $price_max < PHP_FLOAT_MAX) {
+        $query .= " AND monthly_rate BETWEEN ? AND ?";
+        $types .= 'dd';
+        $params[] = $price_min;
+        $params[] = $price_max;
+    } elseif ($price_min > 0) {
+        $query .= " AND monthly_rate >= ?";
+        $types .= 'd';
+        $params[] = $price_min;
+    } elseif ($price_max < PHP_FLOAT_MAX) {
+        $query .= " AND monthly_rate <= ?";
+        $types .= 'd';
+        $params[] = $price_max;
+    }
+}
+
+// Add location filter if specified
+if (!empty($location_filter)) {
+    $query .= " AND description LIKE ?";
+    $types .= 's';
+    $params[] = "%$location_filter%";
+}
+
+// Prepare and execute the query
+$stmt = $conn->prepare($query);
+
+if (!empty($params)) {
+    $stmt->bind_param($types, ...$params);
+}
+
+$stmt->execute();
+$result = $stmt->get_result();
+$stalls = $result->fetch_all(MYSQLI_ASSOC);
+
+// Get unique sizes and locations for dropdowns
+$sizes_query = "SELECT DISTINCT floor_area FROM stalls ORDER BY floor_area";
+$locations_query = "SELECT DISTINCT description FROM stalls ORDER BY description";
+$sizes_result = $conn->query($sizes_query);
+$locations_result = $conn->query($locations_query);
+
+$unique_sizes = [];
+while ($row = $sizes_result->fetch_assoc()) {
+    $unique_sizes[] = $row['floor_area'];
+}
+
+$unique_locations = [];
+while ($row = $locations_result->fetch_assoc()) {
+    $unique_locations[] = $row['description'];
+}
+
+$stmt->close();
+$conn->close();
+?>
+
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Available Stalls - Xentro Mall</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        :root { color-scheme: light only; }
+        body { 
+            font-family: 'Inter', sans-serif;
+            background: #0b1220;
+        }
+        /* Background hero with image + gradient overlay */
+        .hero-bg { position: fixed; inset: 0; z-index: -10; overflow: hidden; }
+        .hero-bg::before { content: ""; position: absolute; inset: 0; background: url('img/bg.jpg') center/cover no-repeat; filter: brightness(0.55) saturate(1.1); transform: scale(1.02); }
+        .hero-bg::after { content: ""; position: absolute; inset: 0; background:
+          radial-gradient(1200px 600px at 10% -10%, rgba(56,189,248,.25), transparent 60%),
+          radial-gradient(900px 500px at 90% 110%, rgba(34,197,94,.20), transparent 60%),
+          linear-gradient(180deg, rgba(2,6,23,.65), rgba(2,6,23,.65));
+          mix-blend-mode: screen; }
+        .stall-card {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            transition: all 0.3s ease;
+        }
+        .stall-card:hover {
+            transform: translateY(-8px);
+            box-shadow: 0 20px 40px rgba(0,0,0,0.3);
+        }
+        .stall-card .card-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+        }
+        .stall-card .card-details {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        .stall-card .card-actions {
+            margin-top: auto;
+        }
+    </style>
+</head>
+<body class="min-h-screen text-slate-800">
+    <div class="hero-bg" aria-hidden="true"></div>
+
+    <!-- Header -->
+    <header class="fixed top-0 inset-x-0 z-40">
+        <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+            <nav class="mt-4 flex items-center justify-between rounded-2xl bg-white/10 backdrop-blur-xl ring-1 ring-white/15 px-4 py-3 shadow-lg">
+                <a href="index.php" class="flex items-center gap-3">
+                    <span class="h-10 w-10 overflow-hidden rounded-xl ring-1 ring-white/30 bg-white/70 flex items-center justify-center shadow">
+                        <img src="img/logo.jpg" alt="XentroMall" class="h-9 w-9 object-cover" />
+                    </span>
+                    <span class="text-white font-semibold tracking-tight text-lg">Xentro Mall</span>
+                </a>
+                <a href="index.php" class="inline-flex items-center gap-2 rounded-lg bg-white/10 backdrop-blur px-4 py-2 text-white hover:bg-white/20 transition">
+                    <i class="fas fa-arrow-left"></i>
+                    <span class="hidden sm:inline">Back to Home</span>
+                </a>
+            </nav>
+        </div>
+    </header>
+
+    <div class="container mx-auto px-4 pt-28 pb-12">
+        <!-- Hero Section -->
+        <div class="text-center mb-12">
+            <div class="inline-flex items-center gap-2 rounded-full bg-white/10 backdrop-blur-xl ring-1 ring-white/20 px-4 py-2 mb-6">
+                <i class="fas fa-store text-emerald-400"></i>
+                <span class="text-sm font-medium text-white/90">Available Spaces</span>
+            </div>
+            <h1 class="text-5xl md:text-6xl font-bold text-white mb-4">Find Your Perfect <span class="bg-gradient-to-r from-blue-400 to-emerald-400 bg-clip-text text-transparent">Space</span></h1>
+            <p class="text-xl text-white/80 max-w-2xl mx-auto">Browse our available stalls and start your business journey today</p>
+        </div>
+        
+        <!-- Filter Section -->
+        <div class="bg-white/90 backdrop-blur-xl rounded-2xl shadow-xl ring-1 ring-white/20 p-6 mb-8">
+            <div class="flex items-center gap-3 mb-6">
+                <div class="h-10 w-10 rounded-xl bg-gradient-to-br from-blue-600 to-emerald-500 text-white flex items-center justify-center shadow-lg">
+                    <i class="fas fa-filter"></i>
+                </div>
+                <h2 class="text-2xl font-bold text-slate-900">Filter Stalls</h2>
+            </div>
+            
+            <form method="get" action="" class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <!-- Size Filter -->
+                <div>
+                    <label for="size" class="block text-slate-700 font-semibold mb-2 flex items-center gap-2">
+                        <i class="fas fa-ruler-combined text-blue-600"></i> Size
+                    </label>
+                    <select id="size" name="size" class="w-full px-4 py-3 border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition">
+                        <option value="">All Sizes</option>
+                        <?php foreach ($unique_sizes as $size): ?>
+                            <option value="<?= htmlspecialchars($size) ?>" <?= $size_filter === $size ? 'selected' : '' ?>>
+                                <?= htmlspecialchars($size) ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                
+                <!-- Price Range Filter -->
+                <div>
+                    <label class="block text-slate-700 font-semibold mb-2 flex items-center gap-2">
+                        <i class="fas fa-peso-sign text-emerald-600"></i> Price Range
+                    </label>
+                    <div class="grid grid-cols-2 gap-3">
+                        <input type="number" name="price_min" placeholder="Min price" 
+                               class="w-full px-4 py-3 border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition" 
+                               value="<?= $price_min > 0 ? htmlspecialchars($price_min) : '' ?>"
+                               min="0" step="100">
+                        <input type="number" name="price_max" placeholder="Max price" 
+                               class="w-full px-4 py-3 border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition" 
+                               value="<?= $price_max < PHP_FLOAT_MAX ? htmlspecialchars($price_max) : '' ?>"
+                               min="0" step="100">
+                    </div>
+                </div>
+                
+                <!-- Location Filter -->
+                <div>
+                    <label for="location" class="block text-slate-700 font-semibold mb-2 flex items-center gap-2">
+                        <i class="fas fa-map-marker-alt text-violet-600"></i> Location
+                    </label>
+                    <select id="location" name="location" class="w-full px-4 py-3 border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition">
+                        <option value="">All Locations</option>
+                        <?php foreach ($unique_locations as $location): ?>
+                            <option value="<?= htmlspecialchars($location) ?>" <?= $location_filter === $location ? 'selected' : '' ?>>
+                                <?= htmlspecialchars($location) ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                
+                <div class="md:col-span-3 flex justify-end space-x-4">
+                    <button type="submit" class="inline-flex items-center gap-2 bg-gradient-to-r from-blue-600 to-emerald-500 hover:from-blue-700 hover:to-emerald-600 text-white px-6 py-3 rounded-xl font-semibold shadow-lg shadow-emerald-500/30 transition-all hover:scale-105">
+                        <i class="fas fa-filter"></i> Apply Filters
+                    </button>
+                    <a href="?" class="inline-flex items-center gap-2 bg-white/80 hover:bg-white text-slate-700 px-6 py-3 rounded-xl font-semibold shadow-lg transition-all hover:scale-105">
+                        <i class="fas fa-redo"></i> Reset
+                    </a>
+                </div>
+            </form>
+        </div>
+        
+        <!-- Results Count -->
+        <?php if (count($stalls) > 0): ?>
+            <div class="mb-6">
+                <p class="text-white/80 text-lg">
+                    <span class="font-semibold text-white"><?= count($stalls) ?></span> stall<?= count($stalls) != 1 ? 's' : '' ?> available
+                </p>
+            </div>
+            
+            <!-- Stalls Grid -->
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                <?php foreach ($stalls as $stall): ?>
+                    <div class="group relative bg-white/90 backdrop-blur-xl rounded-2xl shadow-xl ring-1 ring-white/20 overflow-hidden stall-card h-full">
+                        <div class="relative h-48 overflow-hidden">
+                            <div class="absolute inset-0 bg-gradient-to-br from-blue-500/10 to-emerald-500/10 opacity-0 group-hover:opacity-100 transition-opacity z-10"></div>
+                            <?php if (!empty($stall['image_path'])): ?>
+                                <img src="<?= htmlspecialchars($stall['image_path']) ?>" alt="<?= htmlspecialchars($stall['stall_number']) ?>" class="w-full h-full object-cover group-hover:scale-110 transition-transform duration-300">
+                            <?php else: ?>
+                                <div class="w-full h-full bg-gradient-to-br from-slate-100 to-slate-200 flex items-center justify-center text-slate-400">
+                                    <i class="fas fa-store-alt text-5xl"></i>
+                                </div>
+                            <?php endif; ?>
+                        </div>
+                        <div class="card-content p-6">
+                            <div class="card-details">
+                                <div class="flex justify-between items-start mb-3">
+                                    <h3 class="text-2xl font-bold text-slate-900"><?= htmlspecialchars($stall['stall_number']) ?></h3>
+                                    <span class="bg-gradient-to-r from-emerald-100 to-emerald-50 text-emerald-700 text-xs font-semibold px-3 py-1.5 rounded-full whitespace-nowrap ring-1 ring-emerald-200">
+                                        <i class="fas fa-check-circle"></i> <?= htmlspecialchars($stall['status'] ?? 'Available') ?>
+                                    </span>
+                                </div>
+                                
+                                <div class="space-y-2 mb-4">
+                                    <p class="flex items-center gap-2 text-slate-600">
+                                        <span class="flex-shrink-0 w-8 h-8 rounded-lg bg-blue-100 text-blue-600 flex items-center justify-center">
+                                            <i class="fas fa-ruler-combined text-sm"></i>
+                                        </span>
+                                        <span class="font-medium"><?= htmlspecialchars($stall['floor_area']) ?></span>
+                                    </p>
+                                    <p class="flex items-center gap-2 text-slate-600">
+                                        <span class="flex-shrink-0 w-8 h-8 rounded-lg bg-emerald-100 text-emerald-600 flex items-center justify-center">
+                                            <i class="fas fa-peso-sign text-sm"></i>
+                                        </span>
+                                        <span class="font-bold text-lg text-emerald-600">₱<?= number_format($stall['monthly_rate'], 2) ?><span class="text-sm font-normal text-slate-500">/month</span></span>
+                                    </p>
+                                </div>
+                                
+                                <p class="text-sm text-slate-600 leading-relaxed mb-4">
+                                    <i class="fas fa-map-marker-alt text-violet-500 mr-1"></i> <?= htmlspecialchars($stall['description']) ?>
+                                </p>
+                            <!-- Apply Now Button -->
+                            <div class="card-actions pt-4 border-t border-slate-200">
+                                <button onclick="showConfirmationModal('<?php echo $stall['id']; ?>', '<?php echo htmlspecialchars($stall['stall_number'], ENT_QUOTES); ?>')" 
+                                    class="w-full inline-flex items-center justify-center gap-2 bg-gradient-to-r from-blue-600 to-emerald-500 hover:from-blue-700 hover:to-emerald-600 text-white px-4 py-3 rounded-xl font-semibold shadow-lg shadow-emerald-500/30 transition-all hover:scale-105">
+                                    <i class="fas fa-file-alt"></i> Apply Now
+                                </button>
+                            </div>
+                            </div>
+                        </div>
+                    </div>
+                <?php endforeach; ?>
+            </div>
+        <?php else: ?>
+            <div class="bg-white/90 backdrop-blur-xl rounded-2xl shadow-xl ring-1 ring-white/20 p-12 text-center">
+                <div class="w-20 h-20 mx-auto mb-6 rounded-full bg-gradient-to-br from-slate-100 to-slate-200 flex items-center justify-center">
+                    <i class="fas fa-store-slash text-4xl text-slate-400"></i>
+                </div>
+                <h3 class="text-2xl font-bold text-slate-900 mb-2">No Stalls Found</h3>
+                <p class="text-slate-600 mb-6">Try adjusting your filters or check back later for new listings</p>
+                <a href="?" class="inline-flex items-center gap-2 bg-gradient-to-r from-blue-600 to-emerald-500 hover:from-blue-700 hover:to-emerald-600 text-white px-6 py-3 rounded-xl font-semibold shadow-lg shadow-emerald-500/30 transition-all hover:scale-105">
+                    <i class="fas fa-redo"></i> Reset Filters
+                </a>
+            </div>
+        <?php endif; ?>
+    </div>
+
+    <!-- Confirmation Modal -->
+    <div id="confirmationModal" class="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center hidden z-50">
+        <div class="bg-white/95 backdrop-blur-xl p-8 rounded-2xl max-w-md w-full mx-4 shadow-2xl ring-1 ring-white/20">
+            <div class="w-16 h-16 mx-auto mb-4 rounded-full bg-gradient-to-br from-blue-600 to-emerald-500 flex items-center justify-center">
+                <i class="fas fa-question text-2xl text-white"></i>
+            </div>
+            <h3 class="text-2xl font-bold text-center mb-4 text-slate-900">Confirm Application</h3>
+            <p class="text-center text-slate-600 mb-2">You have selected:</p>
+            <p class="text-center text-xl font-bold text-slate-900 mb-4"><span id="selectedStallNumber"></span></p>
+            <p class="text-center text-slate-600 mb-6">Are you sure you want to apply for this stall?</p>
+            <div class="flex gap-3">
+                <button onclick="hideConfirmationModal()" class="flex-1 px-4 py-3 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-xl font-semibold transition">
+                    Cancel
+                </button>
+                <a id="confirmButton" href="#" class="flex-1 inline-flex items-center justify-center gap-2 bg-gradient-to-r from-blue-600 to-emerald-500 hover:from-blue-700 hover:to-emerald-600 text-white px-4 py-3 rounded-xl font-semibold shadow-lg shadow-emerald-500/30 transition-all hover:scale-105">
+                    <i class="fas fa-check"></i> Continue
+                </a>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    // Global variable to store the current stall ID
+    let currentStallId = null;
+
+    function showConfirmationModal(stallId, stallNumber) {
+        currentStallId = stallId;
+        document.getElementById('selectedStallNumber').textContent = stallNumber;
+        document.getElementById('confirmButton').href = 'tenant_register.php?stall_id=' + stallId;
+        document.getElementById('confirmationModal').classList.remove('hidden');
+        document.body.style.overflow = 'hidden'; // Prevent scrolling when modal is open
+    }
+
+    function hideConfirmationModal() {
+        document.getElementById('confirmationModal').classList.add('hidden');
+        document.body.style.overflow = 'auto'; // Re-enable scrolling
+    }
+
+    // Close modal when clicking outside the modal content
+    document.getElementById('confirmationModal').addEventListener('click', function(e) {
+        if (e.target === this) {
+            hideConfirmationModal();
+        }
+    });
+
+    // Close modal with Escape key
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') {
+            hideConfirmationModal();
+        }
+    });
+    </script>
+</body>
+</html>
