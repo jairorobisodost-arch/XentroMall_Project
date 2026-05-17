@@ -1,0 +1,25 @@
+# Composer dependencies
+/vendor/
+composer.phar
+
+# Uploads and user-generated content
+/uploads/
+
+# Tool-specific metadata
+/.qodo/
+/.gemini/
+/.vscode/
+
+# Config files (local overrides)
+config.local.php
+
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+payment_email_log.txt
+payment_sms_log.txt
+approval_log.txt

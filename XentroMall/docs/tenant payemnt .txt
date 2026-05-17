@@ -1,0 +1,1617 @@
+<?php
+session_start();
+require 'config.php';
+require __DIR__ . '/vendor/autoload.php';
+
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\Exception;
+
+if (!isset($_SESSION['user_id'])) {
+    header('Location: login.php');
+    exit;
+}
+
+$userId = $_SESSION['user_id'];
+
+function ensurePaymentsSchema(PDO $pdo): void {
+    static $checked = false;
+    if ($checked) {
+        return;
+    }
+    $checked = true;
+
+    try {
+        $columns = $pdo->query("SHOW COLUMNS FROM payments")->fetchAll(PDO::FETCH_COLUMN);
+    } catch (PDOException $e) {
+        return;
+    }
+
+    $desiredColumns = [
+        'stall_id' => "ADD COLUMN stall_id INT UNSIGNED NULL AFTER user_id",
+        'amount' => "ADD COLUMN amount DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER stall_id",
+        'payment_method' => "ADD COLUMN payment_method VARCHAR(100) DEFAULT NULL AFTER amount",
+        'reference_number' => "ADD COLUMN reference_number VARCHAR(100) DEFAULT NULL AFTER payment_method",
+        'billing_month' => "ADD COLUMN billing_month VARCHAR(20) DEFAULT NULL AFTER reference_number",
+        'rent_amount' => "ADD COLUMN rent_amount DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER amount",
+        'utilities_amount' => "ADD COLUMN utilities_amount DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER rent_amount",
+        'rent_due' => "ADD COLUMN rent_due DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER utilities_amount",
+        'rent_balance' => "ADD COLUMN rent_balance DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER rent_due",
+        'payment_type' => "ADD COLUMN payment_type VARCHAR(30) DEFAULT NULL AFTER rent_balance"
+    ];
+
+    foreach ($desiredColumns as $column => $alter) {
+        if (!in_array($column, $columns, true)) {
+            try {
+                $pdo->exec("ALTER TABLE payments $alter");
+            } catch (PDOException $e) {
+                // Silently ignore; the column might already exist or user has no permission.
+            }
+        }
+    }
+}
+
+function getRentSummary(PDO $pdo, int $userId, int $stallId): array {
+    $summary = [
+        'monthly_rate' => 0,
+        'months' => [],
+        'total_outstanding' => 0
+    ];
+
+    $stmtRate = $pdo->prepare("SELECT monthly_rate FROM stalls WHERE id = ?");
+    $stmtRate->execute([$stallId]);
+    $monthlyRate = (float)$stmtRate->fetchColumn();
+    if ($monthlyRate <= 0) {
+        return $summary;
+    }
+    $summary['monthly_rate'] = $monthlyRate;
+
+    $stmt = $pdo->prepare("
+        SELECT billing_month,
+               MAX(COALESCE(rent_due, 0)) AS rent_due,
+               SUM(CASE WHEN status IN ('pending', 'approved') THEN COALESCE(rent_amount, 0) ELSE 0 END) AS rent_paid
+        FROM payments
+        WHERE user_id = ? AND stall_id = ? AND billing_month IS NOT NULL
+        GROUP BY billing_month
+    ");
+    $stmt->execute([$userId, $stallId]);
+
+    $months = [];
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $label = $row['billing_month'] ?: '';
+        if (empty($label)) {
+            continue;
+        }
+        $due = (float)$row['rent_due'] ?: $monthlyRate;
+        $paid = (float)$row['rent_paid'] ?: 0;
+        $balance = max($due - $paid, 0);
+
+        $dateObj = DateTime::createFromFormat('F Y', $label) ?: DateTime::createFromFormat('Y-m', $label);
+        if (!$dateObj) {
+            $dateObj = DateTime::createFromFormat('Y-m-d', $label);
+        }
+
+        $months[$label] = [
+            'value' => $label,
+            'label' => $label,
+            'rent_due' => round($due, 2),
+            'rent_paid' => round($paid, 2),
+            'rent_balance' => round($balance, 2),
+            'timestamp' => $dateObj ? (int)$dateObj->format('U') : 0,
+            'is_current' => false
+        ];
+    }
+
+    $currentMonth = DateTime::createFromFormat('Y-m', date('Y-m'));
+    $currentLabel = $currentMonth ? $currentMonth->format('F Y') : date('F Y');
+
+    if (isset($months[$currentLabel])) {
+        $months[$currentLabel]['is_current'] = true;
+        if ($months[$currentLabel]['rent_due'] <= 0) {
+            $months[$currentLabel]['rent_due'] = $summary['monthly_rate'];
+            $months[$currentLabel]['rent_balance'] = max(
+                $summary['monthly_rate'] - $months[$currentLabel]['rent_paid'],
+                0
+            );
+        }
+    } else {
+        $months[$currentLabel] = [
+            'value' => $currentLabel,
+            'label' => $currentLabel,
+            'rent_due' => round($summary['monthly_rate'], 2),
+            'rent_paid' => 0,
+            'rent_balance' => round($summary['monthly_rate'], 2),
+            'timestamp' => $currentMonth ? (int)$currentMonth->format('U') : time(),
+            'is_current' => true
+        ];
+    }
+
+    usort($months, static function ($a, $b) {
+        return $a['timestamp'] <=> $b['timestamp'];
+    });
+
+    foreach ($months as $month) {
+        $summary['total_outstanding'] += max($month['rent_balance'], 0);
+    }
+
+    $summary['months'] = array_map(static function ($month) {
+        unset($month['timestamp']);
+        return $month;
+    }, $months);
+
+    return $summary;
+}
+
+ensurePaymentsSchema($pdo);
+
+// Handle AJAX request for bills by stall
+if (isset($_GET['ajax']) && $_GET['ajax'] === 'get_bills' && isset($_GET['stall_id'])) {
+    $stallId = $_GET['stall_id'];
+    $waterBill = 0;
+    $electricBill = 0;
+    $billImage = null;
+    
+    try {
+        $stmt = $pdo->prepare("SELECT water_bill, electric_bill, bill_image, water_bill_image, electric_bill_image FROM tenant_expenses WHERE user_id = ? AND stall_id = ? ORDER BY id DESC LIMIT 1");
+        $stmt->execute([$userId, $stallId]);
+        $expense = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($expense) {
+            $waterBill = (float)($expense['water_bill'] ?? 0);
+            $electricBill = (float)($expense['electric_bill'] ?? 0);
+            // Use bill_image first, fallback to water_bill_image or electric_bill_image for old data
+            $billImage = $expense['bill_image'] ?? $expense['water_bill_image'] ?? $expense['electric_bill_image'] ?? null;
+        }
+    } catch (PDOException $e) {
+        // Table might not exist yet
+    }
+    
+    $rentSummary = [];
+    if (ctype_digit((string)$stallId)) {
+        $rentSummary = getRentSummary($pdo, (int)$userId, (int)$stallId);
+    }
+
+    header('Content-Type: application/json');
+    echo json_encode([
+        'water_bill' => $waterBill,
+        'electric_bill' => $electricBill,
+        'bill_image' => $billImage,
+        'total' => $waterBill + $electricBill,
+        'rent_summary' => $rentSummary
+    ]);
+    exit;
+}
+
+// Default bills (will be updated via AJAX when stall is selected)
+$waterBill = 0;
+$electricBill = 0;
+
+// Fetch all approved stalls for this tenant
+$stmtStalls = $pdo->prepare("
+    SELECT 
+        td.id as tenant_detail_id,
+        td.tradename,
+        s.id as stall_id,
+        s.stall_number,
+        s.description,
+        s.monthly_rate
+    FROM tenant_details td
+    INNER JOIN stalls s ON td.stall_id = s.id
+    WHERE td.user_id = ? AND td.status = 'approved'
+    ORDER BY s.stall_number
+");
+$stmtStalls->execute([$userId]);
+$approvedStalls = $stmtStalls->fetchAll(PDO::FETCH_ASSOC);
+
+// Check if user is new applicant or existing tenant
+$stmtCheckStatus = $pdo->prepare("
+    SELECT 
+        COUNT(*) as payment_count,
+        MAX(p.payment_date) as last_payment_date
+    FROM payments p
+    WHERE p.user_id = ? AND p.status = 'approved'
+");
+$stmtCheckStatus->execute([$userId]);
+$paymentStatus = $stmtCheckStatus->fetch(PDO::FETCH_ASSOC);
+
+$isNewApplicant = ($paymentStatus['payment_count'] == 0);
+$isExistingTenant = !$isNewApplicant;
+
+// Check for additional stalls that need 3-month advance payment
+$additionalStallNeedsAdvance = false;
+$additionalStallInfo = null;
+$specificStallId = isset($_GET['stall_id']) ? (int)$_GET['stall_id'] : 0;
+$isAdditionalStallRequest = isset($_GET['additional_stall']) && $_GET['additional_stall'] === '1';
+
+if ($isExistingTenant) {
+    // If specific stall ID is provided (from additional stall button), check that specific stall
+    if ($isAdditionalStallRequest && $specificStallId > 0) {
+        $stmtSpecificStall = $pdo->prepare("
+            SELECT 
+                td.id as tenant_detail_id,
+                td.tradename,
+                s.id as stall_id,
+                s.stall_number,
+                s.monthly_rate,
+                td.created_at as approval_date
+            FROM tenant_details td
+            INNER JOIN stalls s ON td.stall_id = s.id
+            WHERE td.user_id = ? AND td.status = 'approved' AND s.id = ?
+            AND NOT EXISTS (
+                SELECT 1 FROM payments p 
+                WHERE p.stall_id = s.id AND p.user_id = ? AND p.status = 'approved'
+            )
+        ");
+        $stmtSpecificStall->execute([$userId, $specificStallId, $userId]);
+        $specificStall = $stmtSpecificStall->fetch(PDO::FETCH_ASSOC);
+        
+        if ($specificStall) {
+            $additionalStallNeedsAdvance = true;
+            $additionalStallInfo = $specificStall;
+        }
+    } else {
+        // Check for any approved additional stalls that haven't been paid yet
+        $stmtAdditionalStalls = $pdo->prepare("
+            SELECT 
+                td.id as tenant_detail_id,
+                td.tradename,
+                s.id as stall_id,
+                s.stall_number,
+                s.monthly_rate,
+                td.created_at as approval_date
+            FROM tenant_details td
+            INNER JOIN stalls s ON td.stall_id = s.id
+            WHERE td.user_id = ? AND td.status = 'approved'
+            AND NOT EXISTS (
+                SELECT 1 FROM payments p 
+                WHERE p.stall_id = s.id AND p.user_id = ? AND p.status = 'approved'
+            )
+            ORDER BY td.created_at DESC
+        ");
+        $stmtAdditionalStalls->execute([$userId, $userId]);
+        $unpaidAdditionalStalls = $stmtAdditionalStalls->fetchAll(PDO::FETCH_ASSOC);
+        
+        if (!empty($unpaidAdditionalStalls)) {
+            $additionalStallNeedsAdvance = true;
+            $additionalStallInfo = $unpaidAdditionalStalls[0]; // Get the most recent unpaid additional stall
+        }
+    }
+}
+
+// Get contract start date for new applicants and additional stalls
+$contractStartDate = null;
+$paymentCoverage = '';
+$nextDueDate = '';
+
+if ($isNewApplicant || $additionalStallNeedsAdvance) {
+    // For new applicants, get the most recent approved tenant detail
+    // For additional stalls, use the specific additional stall info
+    if ($additionalStallNeedsAdvance && $additionalStallInfo) {
+        $stallData = $additionalStallInfo;
+        $monthlyRate = (float)$stallData['monthly_rate'];
+        $stallNumber = $stallData['stall_number'];
+    } else {
+        // New applicant logic
+        $stmtContract = $pdo->prepare("
+            SELECT 
+                td.id,
+                td.tradename,
+                td.status,
+                s.stall_number,
+                s.monthly_rate
+            FROM tenant_details td
+            INNER JOIN stalls s ON td.stall_id = s.id
+            WHERE td.user_id = ? AND td.status = 'approved'
+            ORDER BY td.id DESC
+            LIMIT 1
+        ");
+        $stmtContract->execute([$userId]);
+        $stallData = $stmtContract->fetch(PDO::FETCH_ASSOC);
+        $monthlyRate = $stallData ? (float)$stallData['monthly_rate'] : 0;
+        $stallNumber = $stallData['stall_number'] ?? 'N/A';
+    }
+    
+    // Set contract start date to next month (practical approach)
+    $contractStartDate = new DateTime();
+    $contractStartDate->modify('first day of next month');
+    $startMonth = $contractStartDate->format('F Y');
+    
+    // Calculate coverage (3 months)
+    $coverageEnd = clone $contractStartDate;
+    $coverageEnd->modify('+2 months'); // +2 months because start month counts as month 1
+    $paymentCoverage = $contractStartDate->format('F Y') . ' - ' . $coverageEnd->format('F Y');
+    
+    // Calculate next due date (4th month)
+    $nextDue = clone $coverageEnd;
+    $nextDue->modify('+1 month');
+    $nextDueDate = $nextDue->format('F Y');
+}
+
+// Handle payment submission
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['submit_payment'])) {
+    $stallId = isset($_POST['stall_id']) ? (int)$_POST['stall_id'] : 0;
+    $paymentType = $_POST['payment_type'] ?? '';
+    $billingMonthRaw = trim($_POST['billing_month'] ?? '');
+    $rentAmountInput = isset($_POST['rent_amount']) ? (float)$_POST['rent_amount'] : 0;
+    $utilitiesAmountInput = isset($_POST['utilities_amount']) ? (float)$_POST['utilities_amount'] : 0;
+    $paymentMethod = 'Receipt Upload';
+    $referenceNumber = '';
+    $isNewApplicantPayment = isset($_POST['new_applicant_payment']) && $_POST['new_applicant_payment'] === '1';
+    $isAdditionalStallPayment = isset($_POST['additional_stall_payment']) && $_POST['additional_stall_payment'] === '1';
+
+    if ($isNewApplicantPayment || $isAdditionalStallPayment) {
+        // New Applicant or Additional Stall Logic - 3 months advance payment
+        $startMonth = trim($_POST['start_month'] ?? '');
+        
+        if ($stallId <= 0 || empty($startMonth)) {
+            $_SESSION['error_message'] = "Please complete all required fields (stall, start month).";
+        } else {
+            $stmtRate = $pdo->prepare("SELECT monthly_rate, stall_number FROM stalls WHERE id = ?");
+            $stmtRate->execute([$stallId]);
+            $stallData = $stmtRate->fetch(PDO::FETCH_ASSOC);
+            $monthlyRate = $stallData ? (float)$stallData['monthly_rate'] : 0;
+            $stallNumber = $stallData['stall_number'] ?? 'N/A';
+
+            if ($monthlyRate <= 0) {
+                $_SESSION['error_message'] = "Unable to find the monthly rate for the selected stall.";
+            } else {
+                $totalAmount = $monthlyRate * 3; // 3 months advance
+                
+                if (isset($_FILES['payment_proof']) && $_FILES['payment_proof']['error'] === UPLOAD_ERR_OK) {
+                    $upload_dir = 'uploads/payments/';
+                    if (!is_dir($upload_dir)) {
+                        mkdir($upload_dir, 0755, true);
+                    }
+
+                    $file_name = uniqid() . '_' . basename($_FILES['payment_proof']['name']);
+                    $target_path = $upload_dir . $file_name;
+
+                    if (move_uploaded_file($_FILES['payment_proof']['tmp_name'], $target_path)) {
+                        try {
+                            // Create single payment record for 3 months advance
+                            $startDate = DateTime::createFromFormat('F Y', $startMonth);
+                            $endDate = clone $startDate;
+                            $endDate->modify('+2 months'); // For display purposes
+                            $billingMonth = $startDate->format('F Y') . ' - ' . $endDate->format('F Y');
+                            
+                            $paymentType = $isAdditionalStallPayment ? 'additional_stall_advance' : 'new_applicant_advance';
+                            $paymentDescription = $isAdditionalStallPayment ? 'Additional Stall' : 'New Tenant';
+                            
+                            $stmt = $pdo->prepare("
+                                INSERT INTO payments (
+                                    user_id, stall_id, amount, payment_method,
+                                    reference_number, billing_month, payment_image,
+                                    payment_date, status, rent_amount, utilities_amount,
+                                    rent_due, rent_balance, payment_type
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), 'pending', ?, ?, ?, ?, ?)
+                            ");
+
+                            $stmt->execute([
+                                $userId,
+                                $stallId,
+                                $totalAmount, // Total amount for 3 months
+                                $paymentMethod,
+                                $referenceNumber,
+                                $billingMonth, // Coverage period as billing month
+                                $target_path,
+                                $totalAmount, // Total rent amount
+                                0, // utilities
+                                $totalAmount, // Total due
+                                0, // balance
+                                $paymentType
+                            ]);
+
+                            $successMessage = "✅ {$paymentDescription} payment submitted successfully! 3 months advance payment (₱" . number_format($totalAmount, 2) . ") recorded for $startMonth to " . $endDate->format('F Y') . ". Waiting for admin approval.";
+                            $_SESSION['success_message'] = $successMessage;
+
+                            $mail = new PHPMailer(true);
+                            try {
+                                $mail->isSMTP();
+                                $mail->Host = 'smtp.gmail.com';
+                                $mail->SMTPAuth = true;
+                                $mail->Username = 'mallxentro5@gmail.com';
+                                $mail->Password = 'iwld cjlr kmcy bxab';
+                                $mail->SMTPSecure = 'tls';
+                                $mail->Port = 587;
+
+                                $mail->setFrom('mallxentro5@gmail.com', 'XentroMall System');
+                                $mail->addAddress('mallxentro5@gmail.com', 'XentroMall Admin');
+
+                                $mail->isHTML(true);
+                                $mail->Subject = "💰 {$paymentDescription} Payment - 3 Months Advance";
+                                $mail->Body = "
+                                <h2>{$paymentDescription} Payment Received</h2>
+                                <p><strong>Stall:</strong> {$stallNumber}</p>
+                                <p><strong>Total Amount:</strong> ₱" . number_format($totalAmount, 2) . "</p>
+                                <p><strong>Coverage Period:</strong> {$startMonth} to " . $endDate->format('F Y') . "</p>
+                                <p><strong>Monthly Rate:</strong> ₱" . number_format($monthlyRate, 2) . "</p>
+                                <p><strong>Payment Type:</strong> {$paymentDescription} - 3 Months Advance</p>
+                                <p><strong>Payment Proof:</strong> Uploaded (Receipt/Screenshot)</p>
+                                <p>Please review the receipt and approve in the admin dashboard.</p>
+                                ";
+
+                                $mail->send();
+                            } catch (Exception $e) {
+                                error_log("Email failed: " . $e->getMessage());
+                            }
+
+                            header("Location: tenant_payment.php");
+                            exit;
+                        } catch (PDOException $e) {
+                            $_SESSION['error_message'] = "Error: " . $e->getMessage();
+                        }
+                    } else {
+                        $_SESSION['error_message'] = "Failed to upload payment proof.";
+                    }
+                } else {
+                    $_SESSION['error_message'] = "Please upload payment proof.";
+                }
+            }
+        }
+    } else {
+
+    $billingMonthDate = DateTime::createFromFormat('F Y', $billingMonthRaw) ?: DateTime::createFromFormat('Y-m', $billingMonthRaw);
+    $billingMonth = $billingMonthDate ? $billingMonthDate->format('F Y') : '';
+
+    if ($stallId <= 0 || empty($billingMonth) || empty($paymentType)) {
+        $_SESSION['error_message'] = "Please complete all required fields (stall, billing month, payment type).";
+    } else {
+        $stmtRate = $pdo->prepare("SELECT monthly_rate, stall_number FROM stalls WHERE id = ?");
+        $stmtRate->execute([$stallId]);
+        $stallData = $stmtRate->fetch(PDO::FETCH_ASSOC);
+        $monthlyRate = $stallData ? (float)$stallData['monthly_rate'] : 0;
+        $stallNumber = $stallData['stall_number'] ?? 'N/A';
+
+        if ($monthlyRate <= 0) {
+            $_SESSION['error_message'] = "Unable to find the monthly rate for the selected stall.";
+        } else {
+            $stmtExisting = $pdo->prepare("
+                SELECT 
+                    SUM(CASE WHEN status IN ('pending', 'approved') THEN COALESCE(rent_amount, 0) ELSE 0 END) AS rent_paid,
+                    MAX(COALESCE(rent_due, 0)) AS rent_due
+                FROM payments
+                WHERE user_id = ? AND stall_id = ? AND billing_month = ?
+            ");
+            $stmtExisting->execute([$userId, $stallId, $billingMonth]);
+            $existing = $stmtExisting->fetch(PDO::FETCH_ASSOC);
+            $alreadyPaid = $existing ? (float)$existing['rent_paid'] : 0;
+            $recordedDue = $existing ? (float)$existing['rent_due'] : 0;
+
+            $rentDue = $recordedDue > 0 ? $recordedDue : $monthlyRate;
+            $expectedOutstanding = max($rentDue - $alreadyPaid, 0);
+            $validationError = null;
+            if ($expectedOutstanding <= 0 && $alreadyPaid > 0) {
+                $validationError = "Rent for {$billingMonth} is already fully covered by submitted payments.";
+            }
+            if ($expectedOutstanding <= 0) {
+                $expectedOutstanding = $rentDue > 0 ? $rentDue : $monthlyRate;
+                $alreadyPaid = 0;
+            }
+
+            $normalizedType = $paymentType;
+
+            if ($rentAmountInput < 0) {
+                $validationError = "Rent amount cannot be negative.";
+            } elseif ($paymentType === 'full') {
+                if (abs($rentAmountInput - $expectedOutstanding) > 0.5) {
+                    $validationError = "Full payment must cover the outstanding rent of ₱" . number_format($expectedOutstanding, 2) . ".";
+                } else {
+                    $rentAmountInput = $expectedOutstanding;
+                }
+            } else {
+                $validationError = "Invalid payment type. Please select 'Settle Outstanding Amount'.";
+            }
+
+            $totalAmount = $rentAmountInput + $utilitiesAmountInput;
+
+            if ($totalAmount <= 0 && !$validationError) {
+                $validationError = "Total amount must be greater than zero.";
+            }
+
+            if ($validationError) {
+                $_SESSION['error_message'] = $validationError;
+            } else {
+                $rentBalance = max($rentDue - ($alreadyPaid + $rentAmountInput), 0);
+
+                if (isset($_FILES['payment_proof']) && $_FILES['payment_proof']['error'] === UPLOAD_ERR_OK) {
+                    $upload_dir = 'uploads/payments/';
+                    if (!is_dir($upload_dir)) {
+                        mkdir($upload_dir, 0755, true);
+                    }
+
+                    $file_name = uniqid() . '_' . basename($_FILES['payment_proof']['name']);
+                    $target_path = $upload_dir . $file_name;
+
+                    if (move_uploaded_file($_FILES['payment_proof']['tmp_name'], $target_path)) {
+                        try {
+                            $stmt = $pdo->prepare("
+                                INSERT INTO payments (
+                                    user_id, stall_id, amount, payment_method,
+                                    reference_number, billing_month, payment_image,
+                                    payment_date, status, rent_amount, utilities_amount,
+                                    rent_due, rent_balance, payment_type
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), 'pending', ?, ?, ?, ?, ?)
+                            ");
+
+                            $stmt->execute([
+                                $userId,
+                                $stallId,
+                                $totalAmount,
+                                $paymentMethod,
+                                $referenceNumber,
+                                $billingMonth,
+                                $target_path,
+                                $rentAmountInput,
+                                $utilitiesAmountInput,
+                                $rentDue,
+                                $rentBalance,
+                                $normalizedType
+                            ]);
+
+                            $message = "✅ Payment submitted successfully! Waiting for admin approval.";
+                            if ($rentBalance > 0.01) {
+                                $message .= " Remaining rent balance for {$billingMonth}: ₱" . number_format($rentBalance, 2) . ".";
+                            }
+                            $_SESSION['success_message'] = $message;
+
+                            $mail = new PHPMailer(true);
+                            try {
+                                $mail->isSMTP();
+                                $mail->Host = 'smtp.gmail.com';
+                                $mail->SMTPAuth = true;
+                                $mail->Username = 'mallxentro5@gmail.com';
+                                $mail->Password = 'iwld cjlr kmcy bxab';
+                                $mail->SMTPSecure = 'tls';
+                                $mail->Port = 587;
+
+                                $mail->setFrom('mallxentro5@gmail.com', 'XentroMall System');
+                                $mail->addAddress('mallxentro5@gmail.com', 'XentroMall Admin');
+
+                                $mail->isHTML(true);
+                                $mail->Subject = "💰 New Payment Submission";
+                                $mail->Body = "
+                                <h2>New Payment Received</h2>
+                                <p><strong>Stall:</strong> {$stallNumber}</p>
+                                <p><strong>Amount:</strong> ₱" . number_format($totalAmount, 2) . "</p>
+                                <p><strong>Billing Month:</strong> {$billingMonth}</p>
+                                <p><strong>Rent Portion:</strong> ₱" . number_format($rentAmountInput, 2) . "</p>
+                                <p><strong>Utilities Portion:</strong> ₱" . number_format($utilitiesAmountInput, 2) . "</p>
+                                <p><strong>Remaining Balance:</strong> ₱" . number_format($rentBalance, 2) . "</p>
+                                <p><strong>Payment Proof:</strong> Uploaded (Receipt/Screenshot)</p>
+                                <p>Please review the receipt and approve in the admin dashboard.</p>
+                                ";
+
+                                $mail->send();
+                            } catch (Exception $e) {
+                                error_log("Email failed: " . $e->getMessage());
+                            }
+
+                            header("Location: tenant_payment.php");
+                            exit;
+                        } catch (PDOException $e) {
+                            $_SESSION['error_message'] = "Error: " . $e->getMessage();
+                        }
+                    } else {
+                        $_SESSION['error_message'] = "Failed to upload payment proof.";
+                    }
+                } else {
+                    $_SESSION['error_message'] = "Please upload payment proof.";
+                }
+            }
+        }
+    }
+    }
+}
+
+// Fetch payment history
+$stmtHistory = $pdo->prepare("
+    SELECT 
+        p.*,
+        s.stall_number,
+        s.description
+    FROM payments p
+    LEFT JOIN stalls s ON p.stall_id = s.id
+    WHERE p.user_id = ?
+    ORDER BY p.payment_date DESC
+    LIMIT 20
+");
+$stmtHistory->execute([$userId]);
+$paymentHistory = $stmtHistory->fetchAll(PDO::FETCH_ASSOC);
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Payment - XentroMall</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .gradient-bg { background: linear-gradient(135deg, #10b981 0%, #3b82f6 100%); }
+        .glass-effect { backdrop-filter: blur(10px); background: rgba(255, 255, 255, 0.95); }
+        .blue-gradient { background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); }
+        .green-gradient { background: linear-gradient(135deg, #10b981 0%, #059669 100%); }
+    </style>
+</head>
+<body class="min-h-screen gradient-bg">
+    <div class="container mx-auto px-4 py-8">
+        <!-- Header -->
+        <div class="glass-effect rounded-2xl p-6 mb-6 shadow-xl">
+            <div class="flex items-center justify-between">
+                <div>
+                    <h1 class="text-3xl font-bold text-gray-800">
+                        <i class="fas fa-credit-card text-green-600"></i> Payment Center
+                    </h1>
+                    <p class="text-gray-600 mt-2">Manage your stall payments</p>
+                </div>
+                <a href="tenant_dashboard.php" class="bg-blue-500 hover:bg-blue-600 text-white px-6 py-3 rounded-lg transition">
+                    <i class="fas fa-arrow-left mr-2"></i> Back to Dashboard
+                </a>
+            </div>
+        </div>
+
+        <?php if (isset($_SESSION['success_message'])): ?>
+            <div class="bg-green-100 border-l-4 border-green-500 text-green-700 p-4 mb-6 rounded-lg glass-effect">
+                <p class="font-bold"><i class="fas fa-check-circle mr-2"></i> Success</p>
+                <p><?= htmlspecialchars($_SESSION['success_message']) ?></p>
+            </div>
+            <?php unset($_SESSION['success_message']); ?>
+        <?php endif; ?>
+
+        <?php if (isset($_SESSION['error_message'])): ?>
+            <div class="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 mb-6 rounded-lg glass-effect">
+                <p class="font-bold"><i class="fas fa-exclamation-circle mr-2"></i> Error</p>
+                <p><?= htmlspecialchars($_SESSION['error_message']) ?></p>
+            </div>
+            <?php unset($_SESSION['error_message']); ?>
+        <?php endif; ?>
+
+        <?php if (empty($approvedStalls)): ?>
+            <div class="glass-effect rounded-2xl p-12 text-center shadow-xl">
+                <i class="fas fa-store-slash text-gray-300 text-6xl mb-4"></i>
+                <h3 class="text-2xl font-bold text-gray-800 mb-2">No Approved Stalls</h3>
+                <p class="text-gray-600">You don't have any approved stalls yet. Please wait for admin approval.</p>
+            </div>
+        <?php elseif ($isNewApplicant): ?>
+            <!-- New Applicant Payment Section -->
+            <div class="glass-effect rounded-2xl p-8 mb-6 shadow-xl">
+                <div class="mb-6 p-4 bg-blue-50 border-2 border-blue-200 rounded-lg">
+                    <h2 class="text-2xl font-bold text-blue-800 mb-2">
+                        <i class="fas fa-user-plus text-blue-600 mr-2"></i> New Tenant Payment
+                    </h2>
+                    <p class="text-blue-700">
+                        <i class="fas fa-info-circle mr-2"></i>
+                        Welcome! As a new tenant, you need to pay 3 months advance rent to secure your stall.
+                    </p>
+                </div>
+
+                <!-- Billing Information -->
+                <div class="mb-6 p-4 bg-gradient-to-r from-green-50 to-blue-50 border-2 border-green-300 rounded-lg">
+                    <h3 class="font-bold text-gray-800 mb-3 text-center">
+                        <i class="fas fa-calendar-alt text-green-600 mr-2"></i> Payment Information
+                    </h3>
+                    <div class="text-center">
+                        <div class="mb-4 p-4 bg-white rounded-lg border border-gray-200">
+                            <p class="text-sm text-gray-600 font-semibold uppercase mb-2">Next Payment Due</p>
+                            <p class="text-2xl font-bold text-orange-800"><?= $nextDueDate ?></p>
+                        </div>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div class="p-3 bg-white rounded-lg border border-gray-200">
+                                <p class="text-xs text-gray-600 font-semibold uppercase mb-1">Coverage Period</p>
+                                <p class="text-base font-bold text-green-800"><?= $paymentCoverage ?></p>
+                            </div>
+                            <div class="p-3 bg-white rounded-lg border border-gray-200">
+                                <p class="text-xs text-gray-600 font-semibold uppercase mb-1">Payment Type</p>
+                                <p class="text-base font-bold text-blue-800">3 Months Advance</p>
+                            </div>
+                        </div>
+                        <div class="mt-3 p-2 bg-yellow-50 border border-yellow-200 rounded">
+                            <p class="text-sm text-yellow-800 text-center">
+                                <i class="fas fa-info-circle mr-2"></i>
+                                Pay 3 months advance rent. Next payment due: <?= $nextDueDate ?>
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <form method="POST" enctype="multipart/form-data" class="space-y-6">
+                    <input type="hidden" name="new_applicant_payment" value="1">
+                    <input type="hidden" name="start_month" value="<?= $contractStartDate ? $contractStartDate->format('F Y') : '' ?>">
+                    
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <!-- Stall Selection -->
+                        <div>
+                            <label class="block text-sm font-bold text-gray-700 mb-2">
+                                <i class="fas fa-store mr-1"></i> Select Stall <span class="text-red-500">*</span>
+                            </label>
+                            <select name="stall_id" id="newApplicantStallSelect" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-600 focus:border-transparent">
+                                <option value="">Choose a stall</option>
+                                <?php foreach ($approvedStalls as $stall): ?>
+                                    <option value="<?= $stall['stall_id'] ?>" data-rate="<?= $stall['monthly_rate'] ?>" data-tradename="<?= htmlspecialchars($stall['tradename']) ?>">
+                                        <?= htmlspecialchars($stall['stall_number']) ?> - <?= htmlspecialchars($stall['tradename']) ?> (₱<?= number_format($stall['monthly_rate'], 2) ?>/month)
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <!-- Billing Period (Read-only) -->
+                        <div>
+                            <label class="block text-sm font-bold text-gray-700 mb-2">
+                                <i class="fas fa-calendar-check mr-1"></i> Billing Period <span class="text-gray-500">(Auto-generated)</span>
+                            </label>
+                            <div class="w-full px-4 py-3 bg-gray-100 border border-gray-300 rounded-lg text-gray-700 font-semibold">
+                                <?= $paymentCoverage ?>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Payment Summary -->
+                    <div id="newApplicantSummary" class="hidden bg-gradient-to-br from-blue-50 to-green-50 rounded-xl p-6 border-2 border-blue-300">
+                        <h3 class="font-bold text-gray-800 mb-4"><i class="fas fa-calculator mr-2 text-blue-600"></i>Payment Summary</h3>
+                        <div class="space-y-2">
+                            <div class="flex justify-between items-center">
+                                <span class="text-gray-700">Monthly Rate:</span>
+                                <span class="font-bold text-blue-900" id="monthlyRateDisplay">₱0.00</span>
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <span class="text-gray-700">Number of Months:</span>
+                                <span class="font-bold text-gray-800">3 months (advance)</span>
+                            </div>
+                            <div class="border-t-2 border-blue-300 pt-2 mt-2">
+                                <div class="flex justify-between items-center">
+                                    <span class="text-xl font-bold text-gray-800">Total Payment:</span>
+                                    <span class="text-3xl font-bold text-green-700" id="totalPaymentDisplay">₱0.00</span>
+                                </div>
+                            </div>
+                            <div class="mt-3 p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+                                <p class="text-sm text-yellow-800">
+                                    <i class="fas fa-info-circle mr-2"></i>
+                                    This covers 3 months advance rent. Next payment due: <?= $nextDueDate ?>.
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-1 gap-6">
+                        <!-- Payment Receipt -->
+                        <div>
+                            <label class="block text-sm font-bold text-gray-700 mb-2">
+                                <i class="fas fa-receipt mr-1"></i> Upload Payment Receipt <span class="text-red-500">*</span>
+                            </label>
+                            <input type="file" name="payment_proof" accept="image/*,.pdf" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-600 focus:border-transparent">
+                            <p class="text-xs text-gray-500 mt-1">
+                                <i class="fas fa-info-circle mr-1"></i>
+                                Upload your payment receipt for 3 months advance rent (JPG, PNG, PDF)
+                            </p>
+                        </div>
+                    </div>
+
+                    <button type="submit" name="submit_payment" class="w-full blue-gradient hover:from-blue-700 hover:to-indigo-700 text-white font-bold py-4 px-6 rounded-lg transition transform hover:scale-105 shadow-lg">
+                        <i class="fas fa-paper-plane mr-2"></i> Submit New Tenant Payment
+                    </button>
+                </form>
+            </div>
+
+        <?php elseif ($additionalStallNeedsAdvance): ?>
+            <!-- Additional Stall Payment Section -->
+            <div class="glass-effect rounded-2xl p-8 mb-6 shadow-xl">
+                <div class="mb-6 p-4 bg-green-50 border-2 border-green-200 rounded-lg">
+                    <h2 class="text-2xl font-bold text-green-800 mb-2">
+                        <i class="fas fa-plus-circle text-green-600 mr-2"></i> Additional Stall Payment
+                    </h2>
+                    <p class="text-green-700">
+                        <i class="fas fa-info-circle mr-2"></i>
+                        Congratulations! Your additional stall application has been approved. Please pay 3 months advance rent to activate your new stall.
+                    </p>
+                </div>
+
+                <!-- Billing Information -->
+                <div class="mb-6 p-4 bg-gradient-to-r from-green-50 to-blue-50 border-2 border-green-300 rounded-lg">
+                    <h3 class="font-bold text-gray-800 mb-3 text-center">
+                        <i class="fas fa-calendar-alt text-green-600 mr-2"></i> Payment Information
+                    </h3>
+                    <div class="text-center">
+                        <div class="mb-4 p-4 bg-white rounded-lg border border-gray-200">
+                            <p class="text-sm text-gray-600 font-semibold uppercase mb-2">Next Payment Due</p>
+                            <p class="text-2xl font-bold text-orange-800"><?= $nextDueDate ?></p>
+                        </div>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div class="p-3 bg-white rounded-lg border border-gray-200">
+                                <p class="text-xs text-gray-600 font-semibold uppercase mb-1">Coverage Period</p>
+                                <p class="text-base font-bold text-green-800"><?= $paymentCoverage ?></p>
+                            </div>
+                            <div class="p-3 bg-white rounded-lg border border-gray-200">
+                                <p class="text-xs text-gray-600 font-semibold uppercase mb-1">Payment Type</p>
+                                <p class="text-base font-bold text-green-800">3 Months Advance</p>
+                            </div>
+                        </div>
+                        <div class="mt-3 p-2 bg-yellow-50 border border-yellow-200 rounded">
+                            <p class="text-sm text-yellow-800 text-center">
+                                <i class="fas fa-info-circle mr-2"></i>
+                                Pay 3 months advance rent for your additional stall. Next payment due: <?= $nextDueDate ?>
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <form method="POST" enctype="multipart/form-data" class="space-y-6">
+                    <input type="hidden" name="additional_stall_payment" value="1">
+                    <input type="hidden" name="start_month" value="<?= $contractStartDate ? $contractStartDate->format('F Y') : '' ?>">
+                    
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <!-- Stall Selection (Pre-selected) -->
+                        <div>
+                            <label class="block text-sm font-bold text-gray-700 mb-2">
+                                <i class="fas fa-store mr-1"></i> Additional Stall <span class="text-red-500">*</span>
+                            </label>
+                            <select name="stall_id" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-600 focus:border-transparent">
+                                <?php if ($additionalStallInfo): ?>
+                                    <option value="<?= $additionalStallInfo['stall_id'] ?>" selected>
+                                        <?= htmlspecialchars($additionalStallInfo['stall_number']) ?> - <?= htmlspecialchars($additionalStallInfo['tradename']) ?> (₱<?= number_format($additionalStallInfo['monthly_rate'], 2) ?>/month)
+                                    </option>
+                                <?php endif; ?>
+                            </select>
+                            <p class="text-xs text-green-600 mt-1">
+                                <i class="fas fa-check-circle mr-1"></i>
+                                This is your newly approved additional stall
+                            </p>
+                        </div>
+
+                        <!-- Billing Period (Read-only) -->
+                        <div>
+                            <label class="block text-sm font-bold text-gray-700 mb-2">
+                                <i class="fas fa-calendar-check mr-1"></i> Billing Period <span class="text-gray-500">(Auto-generated)</span>
+                            </label>
+                            <div class="w-full px-4 py-3 bg-gray-100 border border-gray-300 rounded-lg text-gray-700 font-semibold">
+                                <?= $paymentCoverage ?>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Payment Summary -->
+                    <div class="bg-gradient-to-br from-green-50 to-blue-50 rounded-xl p-6 border-2 border-green-300">
+                        <h3 class="font-bold text-gray-800 mb-4"><i class="fas fa-calculator mr-2 text-green-600"></i>Payment Summary</h3>
+                        <div class="space-y-2">
+                            <div class="flex justify-between items-center">
+                                <span class="text-gray-700">Monthly Rate:</span>
+                                <span class="font-bold text-green-900">₱<?= number_format($additionalStallInfo['monthly_rate'] ?? 0, 2) ?></span>
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <span class="text-gray-700">Number of Months:</span>
+                                <span class="font-bold text-gray-800">3 months (advance)</span>
+                            </div>
+                            <div class="border-t-2 border-green-300 pt-2 mt-2">
+                                <div class="flex justify-between items-center">
+                                    <span class="text-xl font-bold text-gray-800">Total Payment:</span>
+                                    <span class="text-3xl font-bold text-green-700">₱<?= number_format(($additionalStallInfo['monthly_rate'] ?? 0) * 3, 2) ?></span>
+                                </div>
+                            </div>
+                            <div class="mt-3 p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+                                <p class="text-sm text-yellow-800">
+                                    <i class="fas fa-info-circle mr-2"></i>
+                                    This covers 3 months advance rent for your additional stall. Next payment due: <?= $nextDueDate ?>.
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-1 gap-6">
+                        <!-- Payment Receipt -->
+                        <div>
+                            <label class="block text-sm font-bold text-gray-700 mb-2">
+                                <i class="fas fa-receipt mr-1"></i> Upload Payment Receipt <span class="text-red-500">*</span>
+                            </label>
+                            <input type="file" name="payment_proof" accept="image/*,.pdf" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-600 focus:border-transparent">
+                            <p class="text-xs text-gray-500 mt-1">
+                                <i class="fas fa-info-circle mr-1"></i>
+                                Upload your payment receipt for 3 months advance rent (JPG, PNG, PDF)
+                            </p>
+                        </div>
+                    </div>
+
+                    <button type="submit" name="submit_payment" class="w-full green-gradient hover:from-green-700 hover:to-emerald-700 text-white font-bold py-4 px-6 rounded-lg transition transform hover:scale-105 shadow-lg">
+                        <i class="fas fa-paper-plane mr-2"></i> Submit Additional Stall Payment
+                    </button>
+                </form>
+            </div>
+
+            <!-- Payment History -->
+            <div class="glass-effect rounded-2xl p-8 shadow-xl">
+                <h2 class="text-2xl font-bold text-gray-800 mb-6">
+                    <i class="fas fa-history text-blue-600 mr-2"></i> Payment History
+                </h2>
+
+                <?php if (empty($paymentHistory)): ?>
+                    <div class="text-center py-8">
+                        <i class="fas fa-receipt text-gray-300 text-4xl mb-3"></i>
+                        <p class="text-gray-500">No payment history yet</p>
+                    </div>
+                <?php else: ?>
+                    <div class="overflow-x-auto">
+                        <table class="w-full">
+                            <thead class="bg-gradient-to-r from-blue-50 to-blue-100 border-b border-blue-200">
+                                <tr>
+                                    <th class="px-4 py-3 text-left text-xs font-bold text-blue-700 uppercase">Date</th>
+                                    <th class="px-4 py-3 text-left text-xs font-bold text-blue-700 uppercase">Stall</th>
+                                    <th class="px-4 py-3 text-left text-xs font-bold text-blue-700 uppercase">Month</th>
+                                    <th class="px-4 py-3 text-left text-xs font-bold text-blue-700 uppercase">Amount</th>
+                                    <th class="px-4 py-3 text-left text-xs font-bold text-blue-700 uppercase">Method</th>
+                                    <th class="px-4 py-3 text-left text-xs font-bold text-blue-700 uppercase">Status</th>
+                                    <th class="px-4 py-3 text-left text-xs font-bold text-blue-700 uppercase">Proof</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-gray-100">
+                                <?php foreach ($paymentHistory as $payment): ?>
+                                    <tr class="hover:bg-gray-50">
+                                        <td class="px-4 py-3 text-sm"><?= date('M d, Y', strtotime($payment['payment_date'])) ?></td>
+                                        <td class="px-4 py-3 text-sm font-semibold"><?= htmlspecialchars($payment['stall_number'] ?? 'N/A') ?></td>
+                                        <td class="px-4 py-3 text-sm"><?= htmlspecialchars($payment['billing_month'] ?? 'N/A') ?></td>
+                                        <td class="px-4 py-3 text-sm font-bold text-green-600">₱<?= number_format($payment['amount'] ?? 0, 2) ?></td>
+                                        <td class="px-4 py-3 text-sm"><?= htmlspecialchars($payment['payment_method'] ?? 'N/A') ?></td>
+                                        <td class="px-4 py-3">
+                                            <span class="px-3 py-1 rounded-full text-xs font-bold <?php 
+                                                echo $payment['status'] === 'approved' ? 'bg-green-100 text-green-800' : 
+                                                    ($payment['status'] === 'pending' ? 'bg-blue-100 text-blue-800' : 'bg-red-100 text-red-800'); 
+                                            ?>">
+                                                <?= ucfirst($payment['status']) ?>
+                                            </span>
+                                        </td>
+                                        <td class="px-4 py-3">
+                                            <?php if ($payment['payment_image']): ?>
+                                                <a href="<?= htmlspecialchars($payment['payment_image']) ?>" target="_blank" class="text-blue-600 hover:text-blue-800">
+                                                    <i class="fas fa-file-image"></i> View
+                                                </a>
+                                            <?php endif; ?>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                <?php endif; ?>
+            </div>
+
+        <?php else: ?>
+            <!-- Existing Tenant Payment Section (Original) -->
+            <!-- Bills Summary -->
+            <div class="glass-effect rounded-2xl p-8 mb-6 shadow-xl">
+                <h2 class="text-2xl font-bold text-gray-800 mb-6">
+                    <i class="fas fa-file-invoice-dollar text-blue-600 mr-2"></i> Current Bills - <?= date('F Y') ?>
+                </h2>
+
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <!-- Water Bill -->
+                    <div class="bg-gradient-to-br from-blue-50 to-blue-100 rounded-xl p-6 border-2 border-blue-300">
+                        <div class="flex items-center gap-3 mb-3">
+                            <div class="w-12 h-12 blue-gradient rounded-xl flex items-center justify-center">
+                                <i class="fas fa-tint text-white text-xl"></i>
+                            </div>
+                            <div>
+                                <p class="text-xs text-blue-700 font-semibold uppercase">Water Bill</p>
+                                <p class="text-2xl font-bold text-blue-900" id="waterBillAmount">₱<?= number_format($waterBill, 2) ?></p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Electric Bill -->
+                    <div class="bg-gradient-to-br from-green-50 to-green-100 rounded-xl p-6 border-2 border-green-300">
+                        <div class="flex items-center gap-3 mb-3">
+                            <div class="w-12 h-12 green-gradient rounded-xl flex items-center justify-center">
+                                <i class="fas fa-bolt text-white text-xl"></i>
+                            </div>
+                            <div>
+                                <p class="text-xs text-green-700 font-semibold uppercase">Electric Bill</p>
+                                <p class="text-2xl font-bold text-green-900" id="electricBillAmount">₱<?= number_format($electricBill, 2) ?></p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Total Bills -->
+                    <div class="bg-gradient-to-br from-blue-50 to-green-50 rounded-xl p-6 border-2 border-blue-300">
+                        <div class="flex items-center gap-3 mb-3">
+                            <div class="w-12 h-12 blue-gradient rounded-xl flex items-center justify-center">
+                                <i class="fas fa-calculator text-white text-xl"></i>
+                            </div>
+                            <div>
+                                <p class="text-xs text-blue-700 font-semibold uppercase">Total Utilities</p>
+                                <p class="text-2xl font-bold text-blue-900" id="totalUtilitiesAmount">₱<?= number_format($waterBill + $electricBill, 2) ?></p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- View Utility Bill Button (shown when bill image is available) -->
+                <div id="billImageContainer" class="hidden mt-4">
+                    <button type="button" onclick="openBillPhotoModal()" class="w-full inline-flex items-center justify-center gap-2 px-5 py-3 bg-gradient-to-r from-emerald-500 to-blue-600 text-white rounded-xl text-sm font-bold hover:from-emerald-600 hover:to-blue-700 transition-all shadow-lg shadow-blue-500/20 hover:scale-[1.02]">
+                        <i class="fas fa-eye"></i> View Utility Bill Photo
+                    </button>
+                </div>
+
+                <div class="mt-4 p-4 bg-gray-50 rounded-lg border border-gray-200" id="noBillsMessage" style="display: none;">
+                    <p class="text-sm text-gray-600 text-center">
+                        <i class="fas fa-info-circle mr-2"></i>
+                        No utility bills for this stall yet. Please select a stall or admin will update bills soon.
+                    </p>
+                </div>
+            </div>
+
+            <!-- Payment Form -->
+            <div class="glass-effect rounded-2xl p-8 mb-6 shadow-xl">
+                <h2 class="text-2xl font-bold text-gray-800 mb-6">
+                    <i class="fas fa-money-bill-wave text-green-600 mr-2"></i> Make Payment
+                </h2>
+
+                <div id="outstandingBanner" class="hidden mb-6 p-4 border border-amber-300 bg-amber-50 text-amber-800 rounded-lg">
+                    <p class="font-semibold"><i class="fas fa-exclamation-triangle mr-2"></i>Outstanding Rent Balance</p>
+                    <p id="outstandingBannerText" class="text-sm mt-1"></p>
+                </div>
+
+                <form method="POST" enctype="multipart/form-data" class="space-y-6">
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <!-- Stall Selection -->
+                        <div>
+                            <label class="block text-sm font-bold text-gray-700 mb-2">
+                                <i class="fas fa-store mr-1"></i> Select Stall <span class="text-red-500">*</span>
+                            </label>
+                            <select name="stall_id" id="stallSelect" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-600 focus:border-transparent">
+                                <option value="">Choose a stall</option>
+                                <?php foreach ($approvedStalls as $stall): ?>
+                                    <option value="<?= $stall['stall_id'] ?>" data-rate="<?= $stall['monthly_rate'] ?>" data-tradename="<?= htmlspecialchars($stall['tradename']) ?>">
+                                        <?= htmlspecialchars($stall['stall_number']) ?> - <?= htmlspecialchars($stall['tradename']) ?> (₱<?= number_format($stall['monthly_rate'], 2) ?>)
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <!-- Payment Type -->
+                        <div>
+                            <label class="block text-sm font-bold text-gray-700 mb-2">
+                                <i class="fas fa-receipt mr-1"></i> Payment Type <span class="text-red-500">*</span>
+                            </label>
+                            <select name="payment_type" id="paymentTypeSelect" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-600 focus:border-transparent">
+                                <option value="">Choose payment type</option>
+                                <option value="full">Settle Outstanding Balance</option>
+                                <option value="monthly">Pay for Monthly Rent Only</option>
+                                <option value="partial">Pay Custom Amount</option>
+                            </select>
+                        </div>
+
+                        <!-- Billing Month -->
+                        <div class="md:col-span-2">
+                            <label class="block text-sm font-bold text-gray-700 mb-2">
+                                <i class="fas fa-calendar-alt mr-1"></i> Billing Month <span class="text-red-500">*</span>
+                            </label>
+                            <select name="billing_month" id="billingMonthSelect" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-600 focus:border-transparent">
+                                <option value="">Select a stall first</option>
+                            </select>
+                            <p class="text-xs text-gray-500 mt-1" id="billingMonthNote"></p>
+                        </div>
+                    </div>
+
+                    <!-- Rent Amount (shows after payment type selected) -->
+                    <div id="rentAmountSection" class="hidden">
+                        <label class="block text-sm font-bold text-gray-700 mb-2">
+                            <i class="fas fa-home mr-1"></i> Rent Amount <span class="text-red-500">*</span>
+                        </label>
+                        <div class="flex items-center gap-2">
+                            <span class="text-gray-600 font-bold text-lg">₱</span>
+                            <input type="number" name="rent_amount" id="rentAmountInput" step="0.01" min="0" required class="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-600 focus:border-transparent text-lg font-semibold" placeholder="0.00" readonly>
+                        </div>
+                        <p class="text-xs text-gray-500 mt-1" id="rentNote"></p>
+                    </div>
+
+                    <!-- Utilities Breakdown -->
+                    <div id="utilitiesSection" class="hidden bg-gradient-to-br from-blue-50 to-green-50 rounded-xl p-6 border-2 border-blue-300">
+                        <h3 class="font-bold text-gray-800 mb-4"><i class="fas fa-bolt mr-2 text-green-600"></i>Utilities (Must Pay Full)</h3>
+                        <div class="space-y-2">
+                            <div class="flex justify-between items-center">
+                                <span class="text-gray-700"><i class="fas fa-tint text-blue-500 mr-2"></i>Water Bill:</span>
+                                <span class="font-bold text-blue-900" id="waterBillDisplay">₱0.00</span>
+                            </div>
+                            <div class="flex justify-between items-center">
+                                <span class="text-gray-700"><i class="fas fa-bolt text-green-600 mr-2"></i>Electric Bill:</span>
+                                <span class="font-bold text-green-900" id="electricBillDisplay">₱0.00</span>
+                            </div>
+                            <div class="border-t-2 border-blue-300 pt-2 mt-2">
+                                <div class="flex justify-between items-center">
+                                    <span class="text-gray-800 font-bold">Utilities Total:</span>
+                                    <span class="font-bold text-lg text-blue-900" id="utilitiesTotalDisplay">₱0.00</span>
+                                </div>
+                            </div>
+                        </div>
+                        <input type="hidden" name="utilities_amount" id="utilitiesAmountInput" value="0">
+                    </div>
+
+                    <!-- Grand Total -->
+                    <div id="grandTotalSection" class="hidden bg-gradient-to-br from-green-50 to-blue-50 rounded-xl p-6 border-2 border-green-300">
+                        <div class="flex justify-between items-center">
+                            <span class="text-xl font-bold text-gray-800"><i class="fas fa-calculator mr-2 text-green-600"></i>TOTAL PAYMENT:</span>
+                            <span class="text-3xl font-bold text-green-700" id="grandTotalDisplay">₱0.00</span>
+                        </div>
+                        <input type="hidden" name="amount" id="totalAmountInput" value="0">
+                    </div>
+
+                    <div class="grid grid-cols-1 gap-6">
+
+                        <!-- Payment Receipt -->
+                        <div class="md:col-span-2">
+                            <label class="block text-sm font-bold text-gray-700 mb-2">
+                                <i class="fas fa-receipt mr-1"></i> Upload Payment Receipt <span class="text-red-500">*</span>
+                            </label>
+                            <input type="file" name="payment_proof" accept="image/*,.pdf" required class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-600 focus:border-transparent">
+                            <p class="text-xs text-gray-500 mt-1">
+                                <i class="fas fa-info-circle mr-1"></i>
+                                Upload your payment receipt or screenshot (JPG, PNG, PDF)
+                            </p>
+                        </div>
+                    </div>
+
+                    <button type="submit" name="submit_payment" class="w-full green-gradient hover:from-green-700 hover:to-emerald-700 text-white font-bold py-4 px-6 rounded-lg transition transform hover:scale-105 shadow-lg">
+                        <i class="fas fa-paper-plane mr-2"></i> Submit Payment
+                    </button>
+                </form>
+            </div>
+
+            <!-- Payment History -->
+            <div class="glass-effect rounded-2xl p-8 shadow-xl">
+                <h2 class="text-2xl font-bold text-gray-800 mb-6">
+                    <i class="fas fa-history text-blue-600 mr-2"></i> Payment History
+                </h2>
+
+                <?php if (empty($paymentHistory)): ?>
+                    <div class="text-center py-8">
+                        <i class="fas fa-receipt text-gray-300 text-4xl mb-3"></i>
+                        <p class="text-gray-500">No payment history yet</p>
+                    </div>
+                <?php else: ?>
+                    <div class="overflow-x-auto">
+                        <table class="w-full">
+                            <thead class="bg-gradient-to-r from-blue-50 to-blue-100 border-b border-blue-200">
+                                <tr>
+                                    <th class="px-4 py-3 text-left text-xs font-bold text-blue-700 uppercase">Date</th>
+                                    <th class="px-4 py-3 text-left text-xs font-bold text-blue-700 uppercase">Stall</th>
+                                    <th class="px-4 py-3 text-left text-xs font-bold text-blue-700 uppercase">Month</th>
+                                    <th class="px-4 py-3 text-left text-xs font-bold text-blue-700 uppercase">Amount</th>
+                                    <th class="px-4 py-3 text-left text-xs font-bold text-blue-700 uppercase">Method</th>
+                                    <th class="px-4 py-3 text-left text-xs font-bold text-blue-700 uppercase">Status</th>
+                                    <th class="px-4 py-3 text-left text-xs font-bold text-blue-700 uppercase">Proof</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-gray-100">
+                                <?php foreach ($paymentHistory as $payment): ?>
+                                    <tr class="hover:bg-gray-50">
+                                        <td class="px-4 py-3 text-sm"><?= date('M d, Y', strtotime($payment['payment_date'])) ?></td>
+                                        <td class="px-4 py-3 text-sm font-semibold"><?= htmlspecialchars($payment['stall_number'] ?? 'N/A') ?></td>
+                                        <td class="px-4 py-3 text-sm"><?= htmlspecialchars($payment['billing_month'] ?? 'N/A') ?></td>
+                                        <td class="px-4 py-3 text-sm font-bold text-green-600">₱<?= number_format($payment['amount'] ?? 0, 2) ?></td>
+                                        <td class="px-4 py-3 text-sm"><?= htmlspecialchars($payment['payment_method'] ?? 'N/A') ?></td>
+                                        <td class="px-4 py-3">
+                                            <span class="px-3 py-1 rounded-full text-xs font-bold <?php 
+                                                echo $payment['status'] === 'approved' ? 'bg-green-100 text-green-800' : 
+                                                    ($payment['status'] === 'pending' ? 'bg-blue-100 text-blue-800' : 'bg-red-100 text-red-800'); 
+                                            ?>">
+                                                <?= ucfirst($payment['status']) ?>
+                                            </span>
+                                        </td>
+                                        <td class="px-4 py-3">
+                                            <?php if ($payment['payment_image']): ?>
+                                                <a href="<?= htmlspecialchars($payment['payment_image']) ?>" target="_blank" class="text-blue-600 hover:text-blue-800">
+                                                    <i class="fas fa-file-image"></i> View
+                                                </a>
+                                            <?php endif; ?>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                <?php endif; ?>
+            </div>
+        <?php endif; ?>
+    </div>
+
+    <script>
+        // New Tenant Payment JavaScript
+        const newApplicantStallSelect = document.getElementById('newApplicantStallSelect');
+        const newApplicantSummary = document.getElementById('newApplicantSummary');
+        const monthlyRateDisplay = document.getElementById('monthlyRateDisplay');
+        const totalPaymentDisplay = document.getElementById('totalPaymentDisplay');
+
+        if (newApplicantStallSelect) {
+            newApplicantStallSelect.addEventListener('change', function() {
+                const selectedOption = this.options[this.selectedIndex];
+                const monthlyRate = selectedOption ? parseFloat(selectedOption.dataset.rate) || 0 : 0;
+                
+                if (monthlyRate > 0) {
+                    updateNewTenantSummary(monthlyRate);
+                } else {
+                    newApplicantSummary.classList.add('hidden');
+                }
+            });
+        }
+
+        function updateNewTenantSummary(monthlyRate) {
+            const totalPayment = monthlyRate * 3;
+            monthlyRateDisplay.textContent = '₱' + monthlyRate.toFixed(2);
+            totalPaymentDisplay.textContent = '₱' + totalPayment.toFixed(2);
+            newApplicantSummary.classList.remove('hidden');
+        }
+
+        // Existing Tenant Payment JavaScript
+        let currentMonthlyRate = 0;
+        let currentWaterBill = 0;
+        let currentElectricBill = 0;
+        let currentRentDue = 0;
+        let currentRentPaid = 0;
+        let currentOutstandingRent = 0;
+        let currentBillingMonth = '';
+        let billingMonthIsCurrent = false;
+
+        const stallSelect = document.getElementById('stallSelect');
+        const paymentTypeSelect = document.getElementById('paymentTypeSelect');
+        const billingMonthSelect = document.getElementById('billingMonthSelect');
+        const billingMonthNote = document.getElementById('billingMonthNote');
+        const outstandingBanner = document.getElementById('outstandingBanner');
+        const outstandingBannerText = document.getElementById('outstandingBannerText');
+
+        function resetSummary() {
+            currentMonthlyRate = 0;
+            currentWaterBill = 0;
+            currentElectricBill = 0;
+            currentRentDue = 0;
+            currentRentPaid = 0;
+            currentOutstandingRent = 0;
+            currentBillingMonth = '';
+            billingMonthIsCurrent = false;
+            billingMonthSelect.innerHTML = '<option value="">Select a stall first</option>';
+            billingMonthNote.textContent = '';
+            outstandingBanner.classList.add('hidden');
+            outstandingBannerText.textContent = '';
+            document.getElementById('waterBillAmount').textContent = '₱0.00';
+            document.getElementById('electricBillAmount').textContent = '₱0.00';
+            document.getElementById('totalUtilitiesAmount').textContent = '₱0.00';
+            const noBillsMsg = document.getElementById('noBillsMessage');
+            if (noBillsMsg) noBillsMsg.style.display = 'none';
+            hideAllSections();
+        }
+
+        // Store current bill image path globally for the modal
+        let currentBillImage = null;
+
+        function openBillPhotoModal() {
+            const modal = document.getElementById('billPhotoModal');
+            const imgEl = document.getElementById('billPhotoViewer');
+            const titleEl = document.getElementById('billPhotoTitle');
+            const downloadLink = document.getElementById('billPhotoDownload');
+            
+            if (!currentBillImage) return;
+
+            imgEl.src = currentBillImage;
+            titleEl.textContent = 'Utility Bill Photo';
+            downloadLink.href = currentBillImage;
+            
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+            document.body.style.overflow = 'hidden';
+        }
+
+        function closeBillPhotoModal() {
+            const modal = document.getElementById('billPhotoModal');
+            modal.classList.add('hidden');
+            modal.classList.remove('flex');
+            document.body.style.overflow = '';
+        }
+
+        stallSelect.addEventListener('change', function() {
+            const stallId = this.value;
+            paymentTypeSelect.value = '';
+            resetSummary();
+
+            if (!stallId) {
+                return;
+            }
+
+            fetch(`?ajax=get_bills&stall_id=${stallId}`)
+                .then(response => response.json())
+                .then(data => {
+                    currentWaterBill = parseFloat(data.water_bill) || 0;
+                    currentElectricBill = parseFloat(data.electric_bill) || 0;
+                    currentBillImage = data.bill_image;
+
+                    document.getElementById('waterBillAmount').textContent = '₱' + currentWaterBill.toFixed(2);
+                    document.getElementById('electricBillAmount').textContent = '₱' + currentElectricBill.toFixed(2);
+                    document.getElementById('totalUtilitiesAmount').textContent = '₱' + (currentWaterBill + currentElectricBill).toFixed(2);
+
+                    // Handle bill image display
+                    const billImgContainer = document.getElementById('billImageContainer');
+                    if (data.bill_image) {
+                        billImgContainer.classList.remove('hidden');
+                    } else {
+                        billImgContainer.classList.add('hidden');
+                    }
+
+                    const noBillsMsg = document.getElementById('noBillsMessage');
+                    if (currentWaterBill === 0 && currentElectricBill === 0 && !data.bill_image) {
+                        if (noBillsMsg) noBillsMsg.style.display = 'block';
+                    } else if (noBillsMsg) {
+                        noBillsMsg.style.display = 'none';
+                    }
+
+                    applyRentSummary(data.rent_summary || null);
+                })
+                .catch(error => {
+                    console.error('Error fetching bills:', error);
+                    resetSummary();
+                });
+        });
+
+        billingMonthSelect.addEventListener('change', function() {
+            const option = this.options[this.selectedIndex];
+            if (!option || !option.value) {
+                currentRentDue = 0;
+                currentRentPaid = 0;
+                currentOutstandingRent = 0;
+                currentBillingMonth = '';
+                billingMonthIsCurrent = false;
+                hideAllSections();
+                billingMonthNote.textContent = '';
+                return;
+            }
+
+            currentBillingMonth = option.value;
+            currentRentDue = parseFloat(option.dataset.rentDue) || currentMonthlyRate;
+            currentRentPaid = parseFloat(option.dataset.rentPaid) || 0;
+            const balanceData = parseFloat(option.dataset.rentBalance);
+            const computedBalance = Math.max(currentRentDue - currentRentPaid, 0);
+            currentOutstandingRent = !isNaN(balanceData) ? Math.max(balanceData, 0) : computedBalance;
+            billingMonthIsCurrent = option.dataset.isCurrent === '1';
+
+            // If no rent due data, use monthly rate
+            if (currentRentDue === 0 && currentMonthlyRate > 0) {
+                currentRentDue = currentMonthlyRate;
+                currentOutstandingRent = Math.max(currentMonthlyRate - currentRentPaid, 0);
+            }
+
+            billingMonthNote.textContent = buildBillingNote(option);
+            paymentTypeSelect.value = '';
+            hideAllSections();
+        });
+
+        paymentTypeSelect.addEventListener('change', function() {
+            const paymentType = this.value;
+            const rentAmountInput = document.getElementById('rentAmountInput');
+            const rentNote = document.getElementById('rentNote');
+
+            if (!currentBillingMonth) {
+                alert('Please select a billing month first.');
+                this.value = '';
+                hideAllSections();
+                return;
+            }
+
+            if (!paymentType) {
+                hideAllSections();
+                return;
+            }
+
+            // Ensure we have a valid monthly rate
+            if (currentMonthlyRate === 0) {
+                const selectedOption = stallSelect.options[stallSelect.selectedIndex];
+                currentMonthlyRate = selectedOption ? parseFloat(selectedOption.dataset.rate) || 0 : 0;
+            }
+
+            if (currentMonthlyRate === 0) {
+                alert('Monthly rate not available for this stall. Please contact admin.');
+                this.value = '';
+                hideAllSections();
+                return;
+            }
+
+            const outstanding = currentOutstandingRent > 0 ? currentOutstandingRent : Math.max(currentRentDue - currentRentPaid, 0);
+            // If outstanding is still 0, use monthly rate for current month
+            const finalOutstanding = outstanding > 0 ? outstanding : (billingMonthIsCurrent ? currentMonthlyRate : 0);
+            
+            let rentAmount = 0;
+            let note = '';
+
+            if (paymentType === 'full') {
+                rentAmount = finalOutstanding;
+                note = finalOutstanding < currentRentDue
+                    ? `Paying remaining balance. Total outstanding: ₱${finalOutstanding.toFixed(2)}`
+                    : `Full rent payment of ₱${finalOutstanding.toFixed(2)}`;
+                rentAmountInput.readOnly = true;
+            } else if (paymentType === 'monthly') {
+                rentAmount = currentMonthlyRate;
+                note = `Paying standard monthly rate for ${currentBillingMonth}.`;
+                rentAmountInput.readOnly = true;
+            } else if (paymentType === 'partial') {
+                rentAmount = 0; // Let user enter
+                note = `Enter custom amount for ${currentBillingMonth}.`;
+                rentAmountInput.readOnly = false;
+            } else {
+                hideAllSections();
+                return;
+            }
+
+            rentAmount = Math.max(0, rentAmount);
+            rentAmountInput.value = rentAmount.toFixed(2);
+            rentNote.textContent = note;
+
+            document.getElementById('rentAmountSection').classList.remove('hidden');
+
+            if (billingMonthIsCurrent) {
+                document.getElementById('utilitiesSection').classList.remove('hidden');
+                document.getElementById('waterBillDisplay').textContent = '₱' + currentWaterBill.toFixed(2);
+                document.getElementById('electricBillDisplay').textContent = '₱' + currentElectricBill.toFixed(2);
+                const utilitiesTotal = currentWaterBill + currentElectricBill;
+                document.getElementById('utilitiesTotalDisplay').textContent = '₱' + utilitiesTotal.toFixed(2);
+                
+                // Automatically include utilities in the hidden input for the formal total
+                document.getElementById('utilitiesAmountInput').value = utilitiesTotal.toFixed(2);
+            } else {
+                document.getElementById('utilitiesSection').classList.add('hidden');
+                document.getElementById('utilitiesAmountInput').value = '0.00';
+                document.getElementById('waterBillDisplay').textContent = '₱0.00';
+                document.getElementById('electricBillDisplay').textContent = '₱0.00';
+                document.getElementById('utilitiesTotalDisplay').textContent = '₱0.00';
+            }
+
+            document.getElementById('grandTotalSection').classList.remove('hidden');
+            calculateTotal();
+        });
+
+        document.getElementById('rentAmountInput').addEventListener('input', function() {
+            const outstanding = currentOutstandingRent > 0 ? currentOutstandingRent : Math.max(currentRentDue - currentRentPaid, 0);
+            let value = parseFloat(this.value) || 0;
+            if (value > outstanding + 0.01) {
+                value = outstanding;
+                this.value = outstanding.toFixed(2);
+            } else if (value < 0) {
+                value = 0;
+                this.value = '0.00';
+            }
+            calculateTotal();
+        });
+
+        function applyRentSummary(summary) {
+            if (!summary || !summary.months || summary.months.length === 0) {
+                // Get monthly rate from selected stall if no billing data
+                const selectedOption = stallSelect.options[stallSelect.selectedIndex];
+                currentMonthlyRate = selectedOption ? parseFloat(selectedOption.dataset.rate) || 0 : 0;
+                
+                currentRentDue = 0;
+                currentRentPaid = 0;
+                currentOutstandingRent = 0;
+                currentBillingMonth = '';
+                billingMonthIsCurrent = true;
+                
+                // Create current month option if no billing data
+                const currentMonth = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long' });
+                billingMonthSelect.innerHTML = `<option value="${currentMonth}">${currentMonth}</option>`;
+                billingMonthNote.textContent = `Monthly rate: ₱${currentMonthlyRate.toFixed(2)}. No previous payment records found.`;
+                outstandingBanner.classList.add('hidden');
+                outstandingBannerText.textContent = '';
+                hideAllSections();
+                return;
+            }
+
+            currentMonthlyRate = parseFloat(summary.monthly_rate) || 0;
+            billingMonthSelect.innerHTML = '<option value="">Select billing month</option>';
+
+            let firstSelectableIndex = -1;
+            summary.months.forEach((month) => {
+                const option = document.createElement('option');
+                option.value = month.value;
+                option.textContent = month.label;
+                option.dataset.rentDue = month.rent_due;
+                option.dataset.rentPaid = month.rent_paid;
+                option.dataset.rentBalance = month.rent_balance;
+                option.dataset.isCurrent = month.is_current ? '1' : '0';
+
+                if (month.rent_balance > 0.01) {
+                    option.textContent += ` - Outstanding ₱${parseFloat(month.rent_balance).toFixed(2)}`;
+                    if (firstSelectableIndex === -1) {
+                        firstSelectableIndex = billingMonthSelect.options.length;
+                    }
+                }
+
+                billingMonthSelect.appendChild(option);
+            });
+
+            if (firstSelectableIndex === -1) {
+                firstSelectableIndex = billingMonthSelect.options.length > 1 ? 1 : 0;
+            }
+
+            billingMonthSelect.selectedIndex = firstSelectableIndex;
+            billingMonthSelect.dispatchEvent(new Event('change'));
+
+            if (summary.total_outstanding > 0.01) {
+                outstandingBanner.classList.remove('hidden');
+                outstandingBannerText.textContent = `Total outstanding rent balance: ₱${summary.total_outstanding.toFixed(2)}. Utilities are billed separately.`;
+            } else {
+                outstandingBanner.classList.add('hidden');
+                outstandingBannerText.textContent = '';
+            }
+        }
+
+        function buildBillingNote(option) {
+            const balance = parseFloat(option.dataset.rentBalance) || 0;
+            const paid = parseFloat(option.dataset.rentPaid) || 0;
+            const due = parseFloat(option.dataset.rentDue) || currentMonthlyRate;
+            const isCurrent = option.dataset.isCurrent === '1';
+
+            if (balance > 0.01) {
+                return `Outstanding rent for ${option.value}: ₱${balance.toFixed(2)} (paid ₱${paid.toFixed(2)} of ₱${due.toFixed(2)}).`;
+            }
+
+            if (paid > 0.01) {
+                return `Rent for ${option.value} is fully covered (₱${paid.toFixed(2)} of ₱${due.toFixed(2)}).`;
+            }
+
+            return isCurrent
+                ? `No rent payment recorded yet for ${option.value}.`
+                : `No rent payment recorded yet for ${option.value}.`;
+        }
+
+        function calculateTotal() {
+            const rentAmount = parseFloat(document.getElementById('rentAmountInput').value) || 0;
+            const utilitiesAmount = parseFloat(document.getElementById('utilitiesAmountInput').value) || 0;
+            const grandTotal = rentAmount + utilitiesAmount;
+
+            document.getElementById('grandTotalDisplay').textContent = '₱' + grandTotal.toFixed(2);
+            document.getElementById('totalAmountInput').value = grandTotal.toFixed(2);
+        }
+
+        function hideAllSections() {
+            document.getElementById('rentAmountSection').classList.add('hidden');
+            document.getElementById('utilitiesSection').classList.add('hidden');
+            document.getElementById('grandTotalSection').classList.add('hidden');
+            document.getElementById('rentAmountInput').value = '0.00';
+            document.getElementById('utilitiesAmountInput').value = '0.00';
+            document.getElementById('grandTotalDisplay').textContent = '₱0.00';
+            document.getElementById('totalAmountInput').value = '0.00';
+            document.getElementById('rentNote').textContent = '';
+        }
+    </script>
+    <!-- Bill Photo Modal -->
+    <div id="billPhotoModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
+        <div class="bg-white rounded-3xl max-w-4xl w-full overflow-hidden shadow-2xl animate-fade-in flex flex-col max-h-[90vh]">
+            <div class="bg-gradient-to-r from-blue-600 to-indigo-700 px-6 py-4 flex items-center justify-between shadow-md">
+                <h3 class="text-white font-black text-xl flex items-center gap-3">
+                    <i class="fas fa-file-invoice-dollar"></i>
+                    <span id="billPhotoTitle">Utility Bill Photo</span>
+                </h3>
+                <button type="button" onclick="closeBillPhotoModal()" class="w-10 h-10 rounded-full bg-white/20 hover:bg-white/30 flex items-center justify-center text-white transition-all border border-white/20">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="flex-1 overflow-auto p-4 bg-gray-100 flex items-center justify-center min-h-[400px]">
+                <img id="billPhotoViewer" src="" alt="Bill Preview" class="max-w-full h-auto rounded-xl shadow-lg border-4 border-white">
+            </div>
+            <div class="px-6 py-4 bg-white border-t flex items-center justify-between gap-4">
+                <p class="text-[11px] text-gray-500 font-bold uppercase tracking-widest">
+                    <i class="fas fa-info-circle mr-1"></i>
+                    Utility charges are for verification only and not included in total
+                </p>
+                <div class="flex gap-2">
+                    <a id="billPhotoDownload" href="#" download class="px-4 py-2 bg-blue-50 text-blue-600 rounded-xl font-bold text-xs hover:bg-blue-100 transition-all flex items-center gap-2">
+                        <i class="fas fa-download"></i> Save Image
+                    </a>
+                    <button type="button" onclick="closeBillPhotoModal()" class="px-6 py-2 bg-blue-600 text-white rounded-xl font-bold text-xs hover:bg-blue-700 transition-all shadow-md">
+                        Done
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <style>
+        @keyframes fade-in {
+            from { opacity: 0; transform: scale(0.95); }
+            to { opacity: 1; transform: scale(1); }
+        }
+        .animate-fade-in {
+            animation: fade-in 0.3s ease-out forwards;
+        }
+    </style>
+</body>
+</html>

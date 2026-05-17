@@ -1,0 +1,784 @@
+<?php
+session_start();
+
+require 'config.php';
+require_once 'contract_helper.php';
+require __DIR__ . '/vendor/autoload.php';
+
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\Exception;
+
+if (!isset($_SESSION['user_id'])) {
+    header('Location: login.php');
+    exit;
+}
+
+$userId = (int) $_SESSION['user_id'];
+$userRole = $_SESSION['role'] ?? 'tenant';
+$contractId = isset($_GET['id']) ? (int) $_GET['id'] : 0;
+
+ensureTenantContractsTable($pdo);
+
+// Ensure admin_signature and signatory_name columns exist
+try {
+    $checkCol = $pdo->query("SHOW COLUMNS FROM tenant_contracts LIKE 'admin_signature'");
+    if ($checkCol->rowCount() === 0) {
+        $pdo->exec("ALTER TABLE tenant_contracts ADD COLUMN admin_signature LONGTEXT DEFAULT NULL");
+    }
+    $checkCol2 = $pdo->query("SHOW COLUMNS FROM tenant_contracts LIKE 'signatory_name'");
+    if ($checkCol2->rowCount() === 0) {
+        $pdo->exec("ALTER TABLE tenant_contracts ADD COLUMN signatory_name VARCHAR(255) DEFAULT NULL");
+    }
+} catch (PDOException $e) {
+    error_log("Could not add signature columns: " . $e->getMessage());
+}
+
+if (!$contractId) {
+    $_SESSION['error_message'] = 'Contract not specified.';
+    header($userRole === 'admin' ? 'Location: admin_dashboard.php' : 'Location: tenant_dashboard.php');
+    exit;
+}
+
+// Handle admin signature save
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && $userRole === 'admin' && isset($_POST['save_signature'])) {
+    $signatureData = $_POST['signature_data'] ?? '';
+    $signatoryName = trim($_POST['signatory_name'] ?? '');
+    
+    if (!empty($signatureData)) {
+        try {
+            $stmt = $pdo->prepare("UPDATE tenant_contracts SET admin_signature = ?, signatory_name = ? WHERE id = ?");
+            $stmt->execute([$signatureData, $signatoryName, $contractId]);
+            $_SESSION['success_message'] = 'Signature saved successfully!';
+        } catch (PDOException $e) {
+            $_SESSION['error_message'] = 'Failed to save signature: ' . $e->getMessage();
+        }
+    } else {
+        $_SESSION['error_message'] = 'Please draw a signature first.';
+    }
+    
+    header("Location: view_contract.php?id=" . $contractId);
+    exit;
+}
+
+// Handle clear signature
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && $userRole === 'admin' && isset($_POST['clear_signature'])) {
+    try {
+        $stmt = $pdo->prepare("UPDATE tenant_contracts SET admin_signature = NULL WHERE id = ?");
+        $stmt->execute([$contractId]);
+        $_SESSION['success_message'] = 'Admin signature removed.';
+    } catch (PDOException $e) {
+        $_SESSION['error_message'] = 'Failed to clear signature.';
+    }
+    
+    header("Location: view_contract.php?id=" . $contractId);
+    exit;
+}
+
+// Handle send signed contract to tenant email
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && $userRole === 'admin' && isset($_POST['send_signed_contract'])) {
+    try {
+        // Get tenant email and contract details
+        $stmt = $pdo->prepare("
+            SELECT tc.*, td.email, td.contact_person, td.tradename, td.company_name, s.stall_number
+            FROM tenant_contracts tc
+            INNER JOIN tenant_details td ON td.id = tc.tenant_detail_id
+            LEFT JOIN stalls s ON s.id = tc.stall_id
+            WHERE tc.id = ?
+        ");
+        $stmt->execute([$contractId]);
+        $contractData = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($contractData && !empty($contractData['email']) && !empty($contractData['admin_signature'])) {
+            $tenantEmail = $contractData['email'];
+            $tenantName = $contractData['contact_person'] ?: $contractData['tradename'] ?: $contractData['company_name'];
+            $stallNum = $contractData['stall_number'] ?? 'N/A';
+            
+            // Create view link
+            $protocol = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ? 'https://' : 'http://';
+            $viewLink = $protocol . $_SERVER['HTTP_HOST'] . dirname($_SERVER['PHP_SELF']) . '/view_contract.php?id=' . $contractId;
+            
+            // Send email using PHPMailer
+            $mail = new PHPMailer(true);
+            $mail->isSMTP();
+            $mail->Host = 'smtp.gmail.com';
+            $mail->SMTPAuth = true;
+            $mail->Username = 'mallxentro5@gmail.com';
+            $mail->Password = 'iwld cjlr kmcy bxab';
+            $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
+            $mail->Port = 587;
+            
+            // Disable SSL certificate verification (for local development)
+            $mail->SMTPOptions = [
+                'ssl' => [
+                    'verify_peer' => false,
+                    'verify_peer_name' => false,
+                    'allow_self_signed' => true
+                ]
+            ];
+            
+            $mail->setFrom('mallxentro5@gmail.com', 'XentroMall Management');
+            $mail->addAddress($tenantEmail, $tenantName);
+            $mail->isHTML(true);
+            
+            $mail->Subject = "✅ Signed Lease Agreement - Stall {$stallNum} | XentroMall";
+            $mail->Body = "
+            <div style='font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;'>
+                <div style='background: linear-gradient(135deg, #0ea5e9 0%, #10b981 100%); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0;'>
+                    <h1 style='margin: 0; font-size: 24px;'>✅ Signed Contract Ready</h1>
+                    <p style='margin: 10px 0 0; font-size: 14px;'>Your Lease Agreement has been signed</p>
+                </div>
+                <div style='background: #f8fafc; padding: 30px; border: 1px solid #e2e8f0; border-top: none;'>
+                    <p style='color: #334155; font-size: 16px;'>Good day <strong>{$tenantName}</strong>,</p>
+                    <p style='color: #475569; line-height: 1.6;'>We are pleased to inform you that your Stall Lease Agreement for <strong>Stall {$stallNum}</strong> at XentroMall has been reviewed and signed by our management.</p>
+                    
+                    <div style='background: #ecfdf5; border: 1px solid #10b981; border-radius: 8px; padding: 15px; margin: 20px 0;'>
+                        <p style='color: #065f46; margin: 0; font-weight: bold;'>📋 Contract Status: SIGNED</p>
+                    </div>
+                    
+                    <p style='color: #475569;'>Please click the button below to view and download your signed contract:</p>
+                    
+                    <div style='text-align: center; margin: 25px 0;'>
+                        <a href='{$viewLink}' style='background: linear-gradient(135deg, #0ea5e9 0%, #10b981 100%); color: white; padding: 14px 30px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;'>View Signed Contract</a>
+                    </div>
+                    
+                    <p style='color: #64748b; font-size: 14px;'>If you have any questions or concerns, please don't hesitate to contact the mall management office.</p>
+                </div>
+                <div style='background: #1e293b; color: #94a3b8; padding: 20px; text-align: center; border-radius: 0 0 10px 10px; font-size: 12px;'>
+                    <p style='margin: 0;'>XentroMall Management</p>
+                    <p style='margin: 5px 0 0;'>This is an automated message. Please do not reply directly to this email.</p>
+                </div>
+            </div>
+            ";
+            
+            $mail->send();
+            
+            // Update contract to mark as sent
+            $pdo->prepare("UPDATE tenant_contracts SET send_email = 1 WHERE id = ?")->execute([$contractId]);
+            
+            $_SESSION['success_message'] = "Signed contract sent successfully to {$tenantEmail}!";
+        } else {
+            if (empty($contractData['admin_signature'])) {
+                $_SESSION['error_message'] = 'Please sign the contract first before sending.';
+            } else {
+                $_SESSION['error_message'] = 'Tenant email not found.';
+            }
+        }
+    } catch (Exception $e) {
+        $_SESSION['error_message'] = 'Failed to send email: ' . $e->getMessage();
+    }
+    
+    header("Location: view_contract.php?id=" . $contractId);
+    exit;
+}
+
+$stmt = $pdo->prepare("
+    SELECT tc.*, td.tradename, td.company_name, td.stall_id, s.stall_number
+    FROM tenant_contracts tc
+    LEFT JOIN tenant_details td ON td.id = tc.tenant_detail_id
+    LEFT JOIN stalls s ON s.id = tc.stall_id
+    WHERE tc.id = ?
+");
+$stmt->execute([$contractId]);
+$contract = $stmt->fetch(PDO::FETCH_ASSOC);
+
+if (!$contract) {
+    $_SESSION['error_message'] = 'Contract not found or has been removed.';
+    header($userRole === 'admin' ? 'Location: admin_dashboard.php' : 'Location: tenant_dashboard.php');
+    exit;
+}
+
+if ($userRole !== 'admin' && (int)$contract['tenant_user_id'] !== $userId) {
+    $_SESSION['error_message'] = 'You are not authorized to view this contract.';
+    header('Location: tenant_dashboard.php');
+    exit;
+}
+
+$contractHtml = $contract['contract_html'] ?? '';
+$downloadPath = $contract['contract_path'] ?? '';
+$adminSignature = $contract['admin_signature'] ?? '';
+$signatoryName = $contract['signatory_name'] ?? '';
+
+$tenantName = $contract['tradename'] ?? $contract['company_name'] ?? 'Tenant';
+$stallNumber = $contract['stall_number'] ?? 'N/A';
+$statusLabel = strtoupper($contract['contract_status'] ?? 'DRAFT');
+$generatedAt = $contract['created_at'] ?? '';
+
+// Get admin title for signature label (use saved name or default)
+$signatureLabel = !empty($signatoryName) ? $signatoryName : getAdminTitle();
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>View Contract - <?= htmlspecialchars($tenantName); ?></title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
+    <script src="https://cdn.jsdelivr.net/npm/signature_pad@4.1.7/dist/signature_pad.umd.min.js"></script>
+</head>
+<body class="bg-slate-100 min-h-screen">
+    <div class="flex gap-4 min-h-screen">
+        <!-- Main Contract Area -->
+        <div class="flex-1 px-4 py-8">
+        <?php if (isset($_SESSION['success_message'])): ?>
+            <div class="mb-6 bg-emerald-50 border border-emerald-200 text-emerald-700 px-5 py-4 rounded-xl flex items-center gap-3">
+                <i class="fas fa-check-circle text-2xl"></i>
+                <div>
+                    <p class="font-semibold">Success!</p>
+                    <p><?= htmlspecialchars($_SESSION['success_message']); ?></p>
+                </div>
+            </div>
+            <?php unset($_SESSION['success_message']); ?>
+        <?php endif; ?>
+
+        <?php if (isset($_SESSION['error_message'])): ?>
+            <div class="mb-6 bg-red-50 border border-red-200 text-red-700 px-5 py-4 rounded-xl flex items-center gap-3">
+                <i class="fas fa-exclamation-circle text-2xl"></i>
+                <div>
+                    <p class="font-semibold">Error!</p>
+                    <p><?= htmlspecialchars($_SESSION['error_message']); ?></p>
+                </div>
+            </div>
+            <?php unset($_SESSION['error_message']); ?>
+        <?php endif; ?>
+
+        <div class="flex items-center gap-4 mb-6">
+            <a href="<?= $userRole === 'admin' ? 'admin_dashboard.php' : 'tenant_dashboard.php'; ?>" class="w-12 h-12 bg-white rounded-xl flex items-center justify-center shadow hover:bg-slate-50 transition">
+                <i class="fas fa-arrow-left text-slate-700"></i>
+            </a>
+            <div>
+                <h1 class="text-3xl font-bold text-slate-900 flex items-center gap-3">
+                    <span><?= htmlspecialchars($tenantName); ?></span>
+                    <span class="text-xs px-3 py-1 rounded-full bg-emerald-100 text-emerald-700 font-semibold"><?= htmlspecialchars($statusLabel); ?></span>
+                </h1>
+                <p class="text-slate-600 text-sm">
+                    Stall: <?= htmlspecialchars($stallNumber); ?> • Generated: <?= htmlspecialchars(date('F d, Y g:i A', strtotime($generatedAt))); ?>
+                </p>
+            </div>
+        </div>
+
+        <div class="bg-white rounded-2xl shadow-xl overflow-hidden border border-slate-200">
+            <div class="bg-gradient-to-r from-sky-500 to-emerald-500 text-white px-6 py-4 flex flex-wrap items-center justify-between gap-3">
+                <div class="text-sm">
+                    <p>Contract ID: <?= htmlspecialchars($contractId); ?></p>
+                    <p>Version: <?= htmlspecialchars($contract['version'] ?? 1); ?></p>
+                </div>
+                <div class="flex items-center gap-3">
+                    <?php if ($downloadPath && file_exists(__DIR__ . '/' . $downloadPath)): ?>
+                        <a href="<?= htmlspecialchars($downloadPath); ?>" download class="inline-flex items-center gap-2 px-4 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-sm font-semibold transition">
+                            <i class="fas fa-download"></i> Download HTML
+                        </a>
+                    <?php endif; ?>
+                    <?php if ($userRole === 'admin'): ?>
+                        <button onclick="copyContractLink()" class="inline-flex items-center gap-2 px-4 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-sm font-semibold transition">
+                            <i class="fas fa-link"></i> Copy Contract Link
+                        </button>
+                    <?php endif; ?>
+                    <button onclick="window.print();" class="inline-flex items-center gap-2 px-4 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-sm font-semibold transition">
+                        <i class="fas fa-print"></i> Print / Save as PDF
+                    </button>
+                </div>
+            </div>
+            <div class="bg-slate-50 border-b border-slate-200 px-6 py-4 text-sm text-slate-600">
+                Tip: Use the print button to export a signed copy as PDF. If email sending fails, use "Copy Contract Link" to share the contract URL with tenants.
+            </div>
+            <div class="contract-preview relative">
+                <?= $contractHtml; ?>
+                
+                <!-- Sidebar Signature for Print (Repeats on every page) -->
+                <?php if (!empty($adminSignature)): ?>
+                <div class="admin-sidebar-signature no-screen">
+                    <img src="<?= $adminSignature; ?>" alt="Signature">
+                    <div class="sidebar-label">Admin Initial</div>
+                </div>
+                <?php endif; ?>
+                
+                <!-- Integrated Signature Section (Bottom of Contract) -->
+                <div class="signatures-wrapper mt-12 p-6 border-t border-slate-100 flex justify-center items-end gap-16">
+                    <!-- Tenant Signature Block -->
+                    <div class="signature-block text-center flex-1">
+                        <div class="signature-space h-20 flex items-center justify-center">
+                            <!-- Placeholder for Tenant E-Signature if implemented later -->
+                            <p class="text-slate-300 italic text-xs">Tenant Signature</p>
+                        </div>
+                        <div class="signature-line">
+                            <p class="font-bold text-slate-900 uppercase tracking-wide" style="font-size: 14px;">
+                                <?= htmlspecialchars($tenantName); ?>
+                            </p>
+                            <p class="text-xs text-slate-500 font-medium">Tenant / Authorized Representative</p>
+                        </div>
+                    </div>
+
+                    <!-- Mall Administrator Signature Block -->
+                    <div class="signature-block text-center flex-1">
+                        <div class="signature-space h-20 flex items-center justify-center">
+                            <?php if (!empty($adminSignature)): ?>
+                                <img src="<?= $adminSignature; ?>" alt="Admin Signature" class="admin-signature-image mb-1">
+                            <?php else: ?>
+                                <p class="text-slate-300 italic text-xs">Admin Signature</p>
+                            <?php endif; ?>
+                        </div>
+                        <div class="signature-line">
+                            <p class="font-bold text-slate-900 uppercase tracking-wide" style="font-size: 14px;">
+                                <?= htmlspecialchars($signatureLabel); ?>
+                            </p>
+                            <p class="text-xs text-slate-500 font-medium">Mall Administrator</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Admin Signature Sidebar Panel (Only for Admin) -->
+    <?php if ($userRole === 'admin'): ?>
+    <div class="w-72 bg-white border-l border-slate-200 shadow-lg p-4 flex flex-col no-print">
+        <div class="mb-4">
+            <h2 class="text-lg font-bold text-slate-800 flex items-center gap-2">
+                <i class="fas fa-signature text-sky-500"></i>
+                Admin E-Signature
+            </h2>
+            <p class="text-xs text-slate-500 mt-1">Draw your signature below. It will appear on the contract when printed.</p>
+        </div>
+        
+        <!-- Signature Status -->
+        <?php if (!empty($adminSignature)): ?>
+        <div class="mb-4 p-3 bg-emerald-50 border border-emerald-200 rounded-lg">
+            <div class="flex items-center gap-2 text-emerald-700 text-sm font-medium mb-2">
+                <i class="fas fa-check-circle"></i>
+                Signature Saved
+            </div>
+            <div class="bg-white border border-emerald-200 rounded p-2 text-center">
+                <img src="<?= $adminSignature; ?>" alt="Current Signature" class="max-w-full h-auto mx-auto" style="max-height: 60px;">
+            </div>
+        </div>
+        <?php endif; ?>
+        
+        <!-- Signature Pad Container -->
+        <div class="flex-1 flex flex-col">
+            <div class="border-2 border-dashed border-slate-300 rounded-xl bg-slate-50 relative overflow-hidden" style="height: 150px;">
+                <canvas id="signatureCanvas" class="w-full h-full cursor-crosshair"></canvas>
+                <div id="signaturePlaceholder" class="absolute inset-0 flex items-center justify-center text-slate-400 text-sm pointer-events-none">
+                    <span><i class="fas fa-pen-fancy mr-2"></i>Draw signature here</span>
+                </div>
+            </div>
+            
+            <!-- Signature Controls -->
+            <div class="flex gap-2 mt-3">
+                <button type="button" onclick="clearSignaturePad()" class="flex-1 px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-sm font-medium transition flex items-center justify-center gap-1">
+                    <i class="fas fa-eraser"></i> Clear
+                </button>
+                <button type="button" onclick="undoSignature()" class="flex-1 px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-sm font-medium transition flex items-center justify-center gap-1">
+                    <i class="fas fa-undo"></i> Undo
+                </button>
+            </div>
+            
+            <!-- Save Form -->
+            <form method="POST" class="mt-4" id="signatureForm">
+                <input type="hidden" name="save_signature" value="1">
+                <input type="hidden" name="signature_data" id="signatureData">
+                
+                <div class="mb-4">
+                    <label class="block text-xs font-semibold text-slate-600 mb-1" for="signatory_name">Admin Name / Title:</label>
+                    <input type="text" name="signatory_name" id="signatory_name" 
+                        value="<?= htmlspecialchars($signatureLabel); ?>" 
+                        class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 transition"
+                        placeholder="e.g. Juan Dela Cruz">
+                </div>
+                
+                <button type="submit" class="w-full px-4 py-3 bg-gradient-to-r from-sky-500 to-emerald-500 hover:from-sky-600 hover:to-emerald-600 text-white rounded-xl text-sm font-semibold transition flex items-center justify-center gap-2 shadow-lg">
+                    <i class="fas fa-save"></i> Save & Apply Signature
+                </button>
+            </form>
+            
+            <?php if (!empty($adminSignature)): ?>
+            <!-- Send Signed Contract to Tenant -->
+            <form method="POST" class="mt-3">
+                <input type="hidden" name="send_signed_contract" value="1">
+                <button type="submit" class="w-full px-4 py-3 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white rounded-xl text-sm font-semibold transition flex items-center justify-center gap-2 shadow-lg">
+                    <i class="fas fa-paper-plane"></i> Send to Tenant Email
+                </button>
+            </form>
+            
+            <!-- Remove Signature -->
+            <form method="POST" class="mt-2">
+                <input type="hidden" name="clear_signature" value="1">
+                <button type="submit" onclick="return confirm('Are you sure you want to remove the signature from this contract?')" class="w-full px-4 py-2 bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 rounded-xl text-sm font-medium transition flex items-center justify-center gap-2">
+                    <i class="fas fa-trash-alt"></i> Remove Signature
+                </button>
+            </form>
+            <?php endif; ?>
+        </div>
+        
+        <!-- Signature Tips -->
+        <div class="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-lg">
+            <div class="text-amber-700 text-xs">
+                <p class="font-semibold mb-1"><i class="fas fa-lightbulb mr-1"></i> Tips:</p>
+                <ul class="list-disc list-inside space-y-1">
+                    <li>Signature appears at the end of the document</li>
+                    <li>Update name above to show on signature line</li>
+                    <li>Use clear, legible strokes</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+    </div>
+    
+    <style>
+        /* Signature Blocks Layout */
+        .signatures-wrapper {
+            break-inside: avoid;
+            page-break-inside: avoid;
+            width: 100%;
+            display: flex;
+            justify-content: center;
+            margin-top: 3rem;
+            padding: 1rem 0;
+            gap: 5rem;
+        }
+        
+        .signature-block {
+            flex: 1;
+            max-width: 300px;
+        }
+
+        .signature-space {
+            min-height: 80px;
+        }
+        
+        .admin-signature-image {
+            width: auto;
+            max-height: 80px;
+            mix-blend-mode: multiply;
+        }
+        
+        .signature-line {
+            border-top: 1.5pt solid #000;
+            padding-top: 0.25rem;
+            text-align: center;
+        }
+        
+        @media print {
+            /* Hide all non-contract elements */
+            body * {
+                visibility: hidden;
+            }
+            
+            /* Hide sidebar and other non-print elements */
+            .no-print, .no-print * {
+                display: none !important;
+            }
+            
+            /* Show only contract content */
+            .contract-preview, .contract-preview * {
+                visibility: visible;
+            }
+            
+            /* Reset positioning for print */
+            .contract-preview {
+                position: absolute;
+                left: 0;
+                top: 0;
+                width: 100%;
+                margin: 0;
+                padding: 0;
+            }
+            
+            /* Integrated signature section for print */
+            .signatures-wrapper {
+                visibility: visible !important;
+                display: flex !important;
+                justify-content: center !important;
+                margin-top: 30px !important;
+                border: none !important;
+                padding: 0 !important;
+                position: relative !important;
+                left: 0 !important;
+                top: 0 !important;
+                transform: none !important;
+                width: 100% !important;
+                gap: 1in !important;
+                page-break-inside: avoid;
+            }
+            
+            .signatures-wrapper, .signatures-wrapper * {
+                visibility: visible !important;
+            }
+            
+            .signature-block {
+                flex: 1 !important;
+                max-width: 3in !important;
+            }
+            
+            .signature-line {
+                border-top: 1pt solid #000 !important;
+            }
+
+            .admin-signature-image {
+                max-height: 70px !important;
+                width: auto !important;
+            }
+            
+            /* Long bond paper size (8.5" x 13") */
+            @page {
+                size: 8.5in 13in;
+                margin: 0.5in 0.7in;
+            }
+            
+            /* Contract print styling */
+            .contract-preview {
+                font-family: 'Times New Roman', serif;
+                font-size: 10.5pt;
+                line-height: 1.25;
+                color: #000;
+                background: white;
+                width: 100%;
+            }
+            
+            /* Contract header */
+            .contract-preview h1, .contract-preview h2 {
+                font-size: 13pt;
+                font-weight: bold;
+                text-align: center;
+                margin: 5px 0;
+                color: #000;
+            }
+            
+            /* Contract sections */
+            .contract-preview h3 {
+                font-size: 11pt;
+                font-weight: bold;
+                margin: 5px 0 2px 0;
+                color: #000;
+            }
+            
+            /* Contract paragraphs */
+            .contract-preview p {
+                font-size: 10.5pt;
+                margin: 4px 0;
+                text-align: justify;
+                color: #000;
+            }
+            
+            /* Contract lists */
+            .contract-preview ul, .contract-preview ol {
+                margin: 6px 0;
+                padding-left: 20px;
+            }
+            
+            .contract-preview li {
+                font-size: 11pt;
+                margin: 3px 0;
+                color: #000;
+            }
+            
+            /* Contract tables */
+            .contract-preview table {
+                width: 100%;
+                border-collapse: collapse;
+                margin: 8px 0;
+                font-size: 11pt;
+            }
+            
+            .contract-preview th, .contract-preview td {
+                border: 1px solid #000;
+                padding: 4px 6px;
+                text-align: left;
+                font-size: 11pt;
+            }
+            
+            .contract-preview th {
+                font-weight: bold;
+                background: #f5f5f5;
+            }
+            
+            /* Contract signatures */
+            .contract-preview .signature-section {
+                margin-top: 20px;
+                text-align: center;
+            }
+            
+            .contract-preview .signature-line {
+                border-bottom: 1px solid #000;
+                width: 200px;
+                margin: 10px auto;
+                height: 20px;
+            }
+            
+            /* Page breaks for 2-page layout */
+            .contract-preview .page-break {
+                page-break-before: always;
+            }
+            
+            /* Prevent breaking inside important elements */
+            .contract-preview .no-break {
+                page-break-inside: avoid;
+            }
+            
+            /* Contract numbering */
+            .contract-preview .contract-number {
+                font-weight: bold;
+                margin-bottom: 10px;
+            }
+            
+            /* Remove all colors and backgrounds (except signature) */
+            .contract-preview > *:not(.admin-signature-container):not(.admin-sidebar-signature) {
+                background: transparent !important;
+                color: #000 !important;
+                border-color: #000 !important;
+            }
+
+            /* Sidebar Signature Styling */
+            .admin-sidebar-signature {
+                position: fixed;
+                right: 0;
+                top: 50%;
+                transform: rotate(-90deg) translateX(50%);
+                transform-origin: right center;
+                display: flex !important;
+                flex-direction: column;
+                align-items: center;
+                gap: 2px;
+                z-index: 9999;
+                opacity: 0.6;
+                width: 150px;
+                pointer-events: none;
+            }
+
+            .admin-sidebar-signature img {
+                max-width: 120px;
+                max-height: 555px;
+                object-fit: contain;
+                mix-blend-mode: multiply;
+            }
+
+            .sidebar-label {
+                font-size: 5pt;
+                color: #888;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                font-family: sans-serif;
+            }
+
+            /* Ensure contract text doesn't hit the signature */
+            .contract-preview {
+                padding-right: 40px !important;
+            }
+        }
+        
+        /* Hide from screen, only show in print */
+        .no-screen {
+            display: none;
+        }
+    </style>
+    
+    <script>
+        function copyContractLink() {
+            const contractLink = window.location.href;
+            
+            // Create a temporary input element to copy the link
+            const tempInput = document.createElement('input');
+            tempInput.value = contractLink;
+            document.body.appendChild(tempInput);
+            tempInput.select();
+            document.execCommand('copy');
+            document.body.removeChild(tempInput);
+            
+            // Show success message
+            const successDiv = document.createElement('div');
+            successDiv.className = 'fixed top-4 right-4 bg-green-500 text-white px-4 py-2 rounded-lg shadow-lg z-50';
+            successDiv.innerHTML = '<i class="fas fa-check-circle mr-2"></i>Contract link copied to clipboard!';
+            document.body.appendChild(successDiv);
+            
+            // Remove success message after 3 seconds
+            setTimeout(() => {
+                document.body.removeChild(successDiv);
+            }, 3000);
+        }
+        
+        <?php if ($userRole === 'admin'): ?>
+        // Signature Pad Setup
+        let signaturePad;
+        let signatureHistory = [];
+        
+        document.addEventListener('DOMContentLoaded', function() {
+            const canvas = document.getElementById('signatureCanvas');
+            const placeholder = document.getElementById('signaturePlaceholder');
+            
+            // Set canvas size
+            function resizeCanvas() {
+                const ratio = Math.max(window.devicePixelRatio || 1, 1);
+                const rect = canvas.getBoundingClientRect();
+                canvas.width = rect.width * ratio;
+                canvas.height = rect.height * ratio;
+                canvas.getContext('2d').scale(ratio, ratio);
+                
+                // Clear and redraw
+                if (signaturePad) {
+                    signaturePad.clear();
+                }
+            }
+            
+            resizeCanvas();
+            window.addEventListener('resize', resizeCanvas);
+            
+            // Initialize signature pad
+            signaturePad = new SignaturePad(canvas, {
+                backgroundColor: 'rgba(255, 255, 255, 0)',
+                penColor: '#1e3a5f',
+                minWidth: 1,
+                maxWidth: 2.5,
+                throttle: 16,
+                velocityFilterWeight: 0.7
+            });
+            
+            // Hide placeholder when drawing starts
+            signaturePad.addEventListener('beginStroke', function() {
+                placeholder.style.display = 'none';
+                // Save state for undo
+                signatureHistory.push(signaturePad.toData());
+            });
+            
+            // Show placeholder if cleared
+            signaturePad.addEventListener('endStroke', function() {
+                if (signaturePad.isEmpty()) {
+                    placeholder.style.display = 'flex';
+                }
+            });
+            
+            // Form submission
+            document.getElementById('signatureForm').addEventListener('submit', function(e) {
+                if (signaturePad.isEmpty()) {
+                    e.preventDefault();
+                    alert('Please draw your signature first.');
+                    return false;
+                }
+                
+                // Convert to data URL
+                const dataUrl = signaturePad.toDataURL('image/png');
+                document.getElementById('signatureData').value = dataUrl;
+            });
+        });
+        
+        function clearSignaturePad() {
+            signaturePad.clear();
+            document.getElementById('signaturePlaceholder').style.display = 'flex';
+            signatureHistory = [];
+        }
+        
+        function undoSignature() {
+            if (signatureHistory.length > 0) {
+                signatureHistory.pop();
+                if (signatureHistory.length > 0) {
+                    signaturePad.fromData(signatureHistory[signatureHistory.length - 1]);
+                } else {
+                    signaturePad.clear();
+                    document.getElementById('signaturePlaceholder').style.display = 'flex';
+                }
+            }
+        }
+        <?php endif; ?>
+    </script>
+</body>
+</html>
